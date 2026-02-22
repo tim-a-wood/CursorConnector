@@ -77,6 +77,7 @@ struct ContentView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
+        .foregroundStyle(.white)
     }
 
     private func triggerBuild() {
