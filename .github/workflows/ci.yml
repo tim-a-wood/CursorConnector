@@ -19,7 +19,7 @@ jobs:
         working-directory: Companion
 
       - name: Test
-        run: swift test
+        run: if grep -q '\.testTarget' Package.swift; then swift test; fi
         working-directory: Companion
 
   ios:

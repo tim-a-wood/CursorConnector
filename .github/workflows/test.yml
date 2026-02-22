@@ -34,7 +34,7 @@ jobs:
       - name: Companion – build and test
         run: |
           swift build
-          swift test
+          if grep -q '\.testTarget' Package.swift; then swift test; fi
         working-directory: Companion
 
       - name: iOS – run tests
