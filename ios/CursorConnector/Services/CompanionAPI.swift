@@ -371,6 +371,47 @@ enum CompanionAPI {
         return try JSONDecoder().decode(GitCommandResponse.self, from: data)
     }
 
+    // MARK: - GitHub Actions
+
+    struct GitHubActionsRun: Codable, Identifiable {
+        var id: Int
+        var name: String
+        var status: String
+        var conclusion: String?
+        var createdAt: String
+        var htmlUrl: String
+        var headBranch: String
+        enum CodingKeys: String, CodingKey {
+            case id, name, status, conclusion
+            case createdAt = "created_at"
+            case htmlUrl = "html_url"
+            case headBranch = "head_branch"
+        }
+    }
+
+    struct GitHubActionsResponse: Codable {
+        var runs: [GitHubActionsRun]
+        var error: String?
+    }
+
+    static func fetchGitHubActions(path: String, host: String, port: Int = defaultPort) async throws -> GitHubActionsResponse {
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            var components = URLComponents(url: base.appendingPathComponent("github/actions"), resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "path", value: path)]
+            guard let url = components.url else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            guard http.statusCode == 200 else {
+                let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
+                throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+            }
+            return try JSONDecoder().decode(GitHubActionsResponse.self, from: data)
+        }
+    }
+
     // MARK: - Xcode build
 
     static let buildTimeout: TimeInterval = 330

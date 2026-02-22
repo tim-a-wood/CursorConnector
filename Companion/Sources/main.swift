@@ -859,6 +859,113 @@ server.POST["/git/push"] = { request in
     return .ok(.data(data, contentType: "application/json"))
 }
 
+// MARK: - GitHub Actions (CI status)
+
+/// Parse owner and repo from git remote URL (https or ssh).
+func parseGitHubOwnerRepo(fromRemoteURL url: String) -> (owner: String, repo: String)? {
+    let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+    // https://github.com/owner/repo or https://github.com/owner/repo.git
+    if trimmed.contains("github.com") {
+        guard let start = trimmed.range(of: "github.com/") ?? trimmed.range(of: "github.com:") else { return nil }
+        let after = String(trimmed[start.upperBound...])
+        let path = after.split(separator: "#").first.map(String.init) ?? after
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 2 else { return nil }
+        var repo = parts[parts.count - 1]
+        if repo.hasSuffix(".git") { repo = String(repo.dropLast(4)) }
+        return (parts[parts.count - 2], repo)
+    }
+    return nil
+}
+
+struct GitHubActionsRun: Codable {
+    var id: Int
+    var name: String
+    var status: String
+    var conclusion: String?
+    var createdAt: String
+    var htmlUrl: String
+    var headBranch: String
+    enum CodingKeys: String, CodingKey {
+        case id, name, status, conclusion
+        case createdAt = "created_at"
+        case htmlUrl = "html_url"
+        case headBranch = "head_branch"
+    }
+}
+
+struct GitHubActionsResponse: Codable {
+    var runs: [GitHubActionsRun]
+    var error: String?
+}
+
+func fetchGitHubActionsRuns(projectPath: String) -> GitHubActionsResponse {
+    guard isGitRepo(path: projectPath) else {
+        return GitHubActionsResponse(runs: [], error: "Not a git repository")
+    }
+    let (remoteOut, _, code) = runGit(in: projectPath, arguments: ["remote", "get-url", "origin"])
+    guard code == 0, let ownerRepo = parseGitHubOwnerRepo(fromRemoteURL: remoteOut) else {
+        return GitHubActionsResponse(runs: [], error: "No GitHub remote (origin) found")
+    }
+    let urlString = "https://api.github.com/repos/\(ownerRepo.owner)/\(ownerRepo.repo)/actions/runs?per_page=10"
+    guard let url = URL(string: urlString) else {
+        return GitHubActionsResponse(runs: [], error: "Invalid GitHub API URL")
+    }
+    var request = URLRequest(url: url)
+    request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    request.setValue("Swift-Companion", forHTTPHeaderField: "User-Agent")
+    let sem = DispatchSemaphore(value: 0)
+    var resultData: Data?
+    var resultError: Error?
+    URLSession.shared.dataTask(with: request) { data, response, error in
+        resultData = data
+        resultError = error
+        if let http = response as? HTTPURLResponse, http.statusCode != 200, let data = data {
+            resultData = nil
+            resultError = NSError(domain: "GitHubAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"])
+        }
+        sem.signal()
+    }.resume()
+    sem.wait()
+    if let err = resultError {
+        return GitHubActionsResponse(runs: [], error: err.localizedDescription)
+    }
+    guard let data = resultData,
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let runsArray = json["workflow_runs"] as? [[String: Any]] else {
+        return GitHubActionsResponse(runs: [], error: "Invalid response from GitHub")
+    }
+    let runs: [GitHubActionsRun] = runsArray.compactMap { run in
+        guard let id = run["id"] as? Int,
+              let name = run["name"] as? String,
+              let status = run["status"] as? String,
+              let createdAt = run["created_at"] as? String,
+              let htmlUrl = run["html_url"] as? String,
+              let headBranch = run["head_branch"] as? String else { return nil }
+        return GitHubActionsRun(
+            id: id,
+            name: name,
+            status: status,
+            conclusion: run["conclusion"] as? String,
+            createdAt: createdAt,
+            htmlUrl: htmlUrl,
+            headBranch: headBranch
+        )
+    }
+    return GitHubActionsResponse(runs: runs, error: nil)
+}
+
+server.GET["/github/actions"] = { request in
+    guard let pathParam = request.queryParams.first(where: { $0.0 == "path" })?.1,
+          let path = pathParam.removingPercentEncoding,
+          !path.isEmpty, path.hasPrefix("/"), !path.contains("..") else {
+        return .badRequest(.text("Missing or invalid 'path' query parameter"))
+    }
+    let response = fetchGitHubActionsRuns(projectPath: path)
+    guard let data = try? JSONEncoder().encode(response) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
 // MARK: - Xcode build and install to device
 
 let xcodeBuildTimeoutSeconds: TimeInterval = 300
@@ -1143,6 +1250,7 @@ do {
     print("  POST /git/generate-message - generate commit message (body: {\"path\": \"...\"})")
     print("  POST /git/commit    - git add -A && commit (body: {\"path\": \"...\", \"message\": \"...\"})")
     print("  POST /git/push     - git push (body: {\"path\": \"...\"})")
+    print("  GET  /github/actions - GitHub Actions workflow runs (query: path=...)")
     print("  POST /xcode-build  - build iOS app and install to connected device (body: optional {\"repoPath\": \"/path\"})")
     print("  POST /restart       - exit process (use with a restarter script to restart)")
     RunLoop.main.run()

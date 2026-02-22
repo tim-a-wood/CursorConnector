@@ -16,6 +16,9 @@ struct GitView: View {
     @State private var actionMessage: String?
     @State private var actionError: String?
     @State private var selectedChange: CompanionAPI.GitChangeEntry?
+    @State private var actionsResponse: CompanionAPI.GitHubActionsResponse?
+    @State private var actionsLoading = false
+    @State private var actionsError: String?
 
     private var hasChanges: Bool { status.map { !$0.changes.isEmpty } ?? false }
 
@@ -43,6 +46,70 @@ struct GitView: View {
                 }
             } header: {
                 Text("Branch")
+            }
+
+            Section {
+                HStack {
+                    Text("CI workflow runs")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Button {
+                        Task { await loadGitHubActions() }
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                            .font(.subheadline)
+                    }
+                    .disabled(actionsLoading)
+                }
+                if actionsLoading && actionsResponse == nil {
+                    HStack {
+                        ProgressView()
+                            .scaleEffect(0.9)
+                        Text("Loading…")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                    }
+                }
+                if let err = actionsError ?? actionsResponse?.error, !err.isEmpty {
+                    Text(err)
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                }
+                if let runs = actionsResponse?.runs, !runs.isEmpty {
+                    ForEach(runs) { run in
+                        Button {
+                            if let url = URL(string: run.htmlUrl) {
+                                UIApplication.shared.open(url)
+                            }
+                        } label: {
+                            HStack(alignment: .center, spacing: 10) {
+                                Image(systemName: iconForActionsConclusion(run.conclusion, status: run.status))
+                                    .foregroundStyle(colorForActionsConclusion(run.conclusion, status: run.status))
+                                    .font(.body)
+                                    .frame(width: 24, alignment: .center)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(run.name)
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.primary)
+                                    Text("\(run.headBranch) · \(relativeTime(run.createdAt))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                Image(systemName: "arrow.up.right.square")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else if actionsResponse != nil && actionsError == nil && (actionsResponse?.error?.isEmpty ?? true) {
+                    Text("No workflow runs")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
+            } header: {
+                Text("GitHub Actions")
             }
 
             Section {
@@ -151,10 +218,66 @@ struct GitView: View {
         }
         .task {
             await loadStatus()
+            await loadGitHubActions()
         }
         .refreshable {
             await loadStatus()
+            await loadGitHubActions()
         }
+    }
+
+    private func loadGitHubActions() async {
+        actionsLoading = true
+        actionsError = nil
+        defer { actionsLoading = false }
+        do {
+            let response = try await CompanionAPI.fetchGitHubActions(path: projectPath, host: host, port: port)
+            await MainActor.run {
+                actionsResponse = response
+                if let err = response.error, !err.isEmpty { actionsError = err }
+            }
+        } catch {
+            await MainActor.run {
+                actionsError = error.localizedDescription
+                actionsResponse = nil
+            }
+        }
+    }
+
+    private func iconForActionsConclusion(_ conclusion: String?, status: String) -> String {
+        if status == "in_progress" || status == "queued" {
+            return "clock.arrow.circlepath"
+        }
+        switch conclusion?.lowercased() {
+        case "success": return "checkmark.circle.fill"
+        case "failure", "cancelled": return "xmark.circle.fill"
+        case "skipped": return "forward.circle.fill"
+        default: return "circle.dashed"
+        }
+    }
+
+    private func colorForActionsConclusion(_ conclusion: String?, status: String) -> Color {
+        if status == "in_progress" || status == "queued" { return .orange }
+        switch conclusion?.lowercased() {
+        case "success": return .green
+        case "failure", "cancelled": return .red
+        case "skipped": return .secondary
+        default: return .secondary
+        }
+    }
+
+    private func relativeTime(_ iso8601: String) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if formatter.date(from: iso8601) == nil {
+            formatter.formatOptions = [.withInternetDateTime]
+        }
+        guard let date = formatter.date(from: iso8601) else { return iso8601 }
+        let interval = Date().timeIntervalSince(date)
+        if interval < 60 { return "just now" }
+        if interval < 3600 { return "\(Int(interval / 60))m ago" }
+        if interval < 86400 { return "\(Int(interval / 3600))h ago" }
+        return "\(Int(interval / 86400))d ago"
     }
 
     private func iconForStatus(_ status: String) -> String {
