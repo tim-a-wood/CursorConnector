@@ -4,7 +4,20 @@ enum CompanionAPI {
     static let defaultPort: Int = 9283
     /// Agent can run up to 5 min on the server; wait slightly longer so we get the response.
     static let promptTimeout: TimeInterval = 320
-    static let fileRequestTimeout: TimeInterval = 30
+    /// Timeout for file and other short requests. Generous so brief app suspend doesn’t cause spurious timeouts.
+    static let fileRequestTimeout: TimeInterval = 150
+
+    /// Retries the operation once on timeout or network error (e.g. after app suspend). Use for idempotent requests only.
+    private static func withRetry<T>(_ operation: () async throws -> T) async rethrows -> T {
+        do {
+            return try await operation()
+        } catch {
+            let retryable = (error as NSError).domain == NSURLErrorDomain
+                && ([NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost, NSURLErrorNotConnectedToInternet, NSURLErrorCancelled].contains((error as NSError).code))
+            guard retryable else { throw error }
+            return try await operation()
+        }
+    }
 
     static func baseURL(host: String, port: Int = defaultPort) -> URL? {
         var components = URLComponents()
@@ -15,32 +28,36 @@ enum CompanionAPI {
     }
 
     static func fetchProjects(host: String, port: Int = defaultPort) async throws -> [ProjectEntry] {
-        guard let base = baseURL(host: host, port: port) else {
-            throw URLError(.badURL)
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else {
+                throw URLError(.badURL)
+            }
+            let url = base.appendingPathComponent("projects")
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                throw URLError(.badServerResponse)
+            }
+            return try JSONDecoder().decode([ProjectEntry].self, from: data)
         }
-        let url = base.appendingPathComponent("projects")
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw URLError(.badServerResponse)
-        }
-        return try JSONDecoder().decode([ProjectEntry].self, from: data)
     }
 
     static func openProject(path: String, host: String, port: Int = defaultPort) async throws {
-        guard let base = baseURL(host: host, port: port) else {
-            throw URLError(.badURL)
-        }
-        let url = base.appendingPathComponent("projects/open")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(["path": path])
-        let (_, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw URLError(.badServerResponse)
-        }
-        guard http.statusCode == 200 else {
-            throw URLError(.badServerResponse)
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else {
+                throw URLError(.badURL)
+            }
+            let url = base.appendingPathComponent("projects/open")
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = fileRequestTimeout
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(["path": path])
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                throw URLError(.badServerResponse)
+            }
         }
     }
 
@@ -75,20 +92,27 @@ enum CompanionAPI {
     /// Called by the app delegate when the system delivers background URLSession events. Set and cleared by UIApplicationDelegate.
     static var backgroundSessionCompletionHandler: (() -> Void)?
 
-    /// Streams agent output via Server-Sent Events. Uses a background URLSession so the request continues when the app is suspended.
+    /// Streams agent output via Server-Sent Events. Uses a *foreground* URLSession so chunks are delivered in real time (background sessions buffer the response until completion, so continuous feedback would not work).
     static func sendPromptStream(
         path: String,
         prompt: String,
         host: String,
         port: Int = defaultPort,
+        streamThinking: Bool = true,
         onChunk: @escaping (String) -> Void,
+        onThinkingChunk: ((String) -> Void)? = nil,
         onComplete: @escaping (Error?) -> Void
     ) {
         guard let base = baseURL(host: host, port: port) else {
             onComplete(URLError(.badURL))
             return
         }
-        let url = base.appendingPathComponent("prompt-stream")
+        var url = base.appendingPathComponent("prompt-stream")
+        if streamThinking {
+            var comp = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+            comp.queryItems = [URLQueryItem(name: "stream", value: "json")]
+            if let u = comp.url { url = u }
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = promptTimeout
@@ -99,14 +123,23 @@ enum CompanionAPI {
             onComplete(error)
             return
         }
-        streamDelegate.setCallbacks(onChunk: onChunk, onComplete: onComplete)
-        let task = backgroundURLSession.dataTask(with: request)
+        streamDelegate.setCallbacks(onChunk: onChunk, onThinkingChunk: onThinkingChunk, onComplete: onComplete)
+        let task = foregroundURLSession.dataTask(with: request)
         streamDelegate.task = task
         task.resume()
     }
 
     private static let backgroundSessionIdentifier = "com.cursorconnector.prompt-stream"
     private static let streamDelegate = StreamDelegate()
+    /// Foreground session so response body is delivered incrementally (continuous feedback). Background sessions buffer until completion.
+    /// Timeouts set so agent can think for several minutes before first byte without the client timing out (default 60s would fire too soon).
+    private static let foregroundURLSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        let timeout: TimeInterval = 330  // match promptTimeout; must exceed URLSession default 60s
+        config.timeoutIntervalForRequest = timeout
+        config.timeoutIntervalForResource = timeout + 60
+        return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
+    }()
     private static let backgroundURLSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: backgroundSessionIdentifier)
         return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
@@ -118,6 +151,7 @@ enum CompanionAPI {
         let url = base.appendingPathComponent("restart")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = fileRequestTimeout
         let (_, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw URLError(.badServerResponse)
@@ -127,8 +161,10 @@ enum CompanionAPI {
     static func health(host: String, port: Int = defaultPort) async -> Bool {
         guard let base = baseURL(host: host, port: port) else { return false }
         let url = base.appendingPathComponent("health")
+        var request = URLRequest(url: url)
+        request.timeoutInterval = fileRequestTimeout
         do {
-            let (_, response) = try await URLSession.shared.data(from: url)
+            let (_, response) = try await withRetry { try await URLSession.shared.data(for: request) }
             return (response as? HTTPURLResponse)?.statusCode == 200
         } catch {
             return false
@@ -154,33 +190,41 @@ enum CompanionAPI {
     }
 
     static func fetchFileTree(path: String, host: String, port: Int = defaultPort) async throws -> [FileTreeEntry] {
-        guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
-        var components = URLComponents(url: base.appendingPathComponent("files/tree"), resolvingAgainstBaseURL: false)!
-        let normalizedPath = (path as NSString).standardizingPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        components.queryItems = [URLQueryItem(name: "path", value: normalizedPath)]
-        guard let url = components.url else { throw URLError(.badURL) }
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        guard http.statusCode == 200 else {
-            let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
-            throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            var components = URLComponents(url: base.appendingPathComponent("files/tree"), resolvingAgainstBaseURL: false)!
+            let normalizedPath = (path as NSString).standardizingPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            components.queryItems = [URLQueryItem(name: "path", value: normalizedPath)]
+            guard let url = components.url else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            guard http.statusCode == 200 else {
+                let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
+                throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+            }
+            let decoded = try JSONDecoder().decode(FileTreeResponse.self, from: data)
+            return decoded.entries
         }
-        let decoded = try JSONDecoder().decode(FileTreeResponse.self, from: data)
-        return decoded.entries
     }
 
     static func fetchFileContent(path: String, host: String, port: Int = defaultPort) async throws -> FileContentResponse {
-        guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
-        var components = URLComponents(url: base.appendingPathComponent("files/content"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "path", value: path)]
-        guard let url = components.url else { throw URLError(.badURL) }
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        guard http.statusCode == 200 else {
-            let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
-            throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            var components = URLComponents(url: base.appendingPathComponent("files/content"), resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "path", value: path)]
+            guard let url = components.url else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            guard http.statusCode == 200 else {
+                let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
+                throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+            }
+            return try JSONDecoder().decode(FileContentResponse.self, from: data)
         }
-        return try JSONDecoder().decode(FileContentResponse.self, from: data)
     }
 
     static func saveFileContent(path: String, content: String, host: String, port: Int = defaultPort) async throws {
@@ -206,7 +250,7 @@ enum CompanionAPI {
 
     // MARK: - Git
 
-    struct GitChangeEntry: Codable, Identifiable {
+    struct GitChangeEntry: Codable, Identifiable, Hashable {
         var status: String
         var path: String
         var id: String { path }
@@ -228,17 +272,44 @@ enum CompanionAPI {
     }
 
     static func fetchGitStatus(path: String, host: String, port: Int = defaultPort) async throws -> GitStatusResponse {
-        guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
-        var components = URLComponents(url: base.appendingPathComponent("git/status"), resolvingAgainstBaseURL: false)!
-        components.queryItems = [URLQueryItem(name: "path", value: path)]
-        guard let url = components.url else { throw URLError(.badURL) }
-        let (data, response) = try await URLSession.shared.data(from: url)
-        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
-        guard http.statusCode == 200 else {
-            let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
-            throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            var components = URLComponents(url: base.appendingPathComponent("git/status"), resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "path", value: path)]
+            guard let url = components.url else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            guard http.statusCode == 200 else {
+                let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
+                throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+            }
+            return try JSONDecoder().decode(GitStatusResponse.self, from: data)
         }
-        return try JSONDecoder().decode(GitStatusResponse.self, from: data)
+    }
+
+    struct GitDiffResponse: Codable {
+        var diff: String
+    }
+
+    static func fetchGitDiff(path: String, file: String, host: String, port: Int = defaultPort) async throws -> String {
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            var components = URLComponents(url: base.appendingPathComponent("git/diff"), resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "path", value: path), URLQueryItem(name: "file", value: file)]
+            guard let url = components.url else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            guard http.statusCode == 200 else {
+                let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
+                throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+            }
+            let decoded = try JSONDecoder().decode(GitDiffResponse.self, from: data)
+            return decoded.diff
+        }
     }
 
     static func generateCommitMessage(path: String, host: String, port: Int = defaultPort) async throws -> String {
@@ -328,50 +399,72 @@ private struct XcodeBuildRequest: Codable {
 private class StreamDelegate: NSObject, URLSessionDataDelegate {
     private var buffer = ""
     private var onChunk: ((String) -> Void)?
+    private var onThinkingChunk: ((String) -> Void)?
     private var onComplete: ((Error?) -> Void)?
     weak var task: URLSessionDataTask?
 
-    func setCallbacks(onChunk: @escaping (String) -> Void, onComplete: @escaping (Error?) -> Void) {
+    func setCallbacks(onChunk: @escaping (String) -> Void, onThinkingChunk: ((String) -> Void)? = nil, onComplete: @escaping (Error?) -> Void) {
         self.onChunk = onChunk
+        self.onThinkingChunk = onThinkingChunk
         self.onComplete = onComplete
     }
 
     private func clearCallbacks() {
         onChunk = nil
+        onThinkingChunk = nil
         onComplete = nil
+    }
+
+    private func processSSEEvent(_ eventBlock: String) {
+        let lines = eventBlock.split(separator: "\n", omittingEmptySubsequences: false)
+        var eventType: String?
+        var payload = ""
+        for line in lines {
+            let s = String(line).trimmingCharacters(in: .whitespaces)
+            if s.hasPrefix("event: ") {
+                eventType = String(s.dropFirst(7))
+            } else if s.hasPrefix("data: ") {
+                payload += (payload.isEmpty ? "" : "\n") + String(s.dropFirst(6))
+            }
+        }
+        guard !payload.isEmpty else { return }
+        if eventType == "thinking" {
+            onThinkingChunk?(payload)
+        } else {
+            onChunk?(payload)
+        }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let str = String(data: data, encoding: .utf8) else { return }
         buffer += str
         while let range = buffer.range(of: "\n\n") {
-            let event = String(buffer[..<range.lowerBound])
+            let eventBlock = String(buffer[..<range.lowerBound])
             buffer = String(buffer[range.upperBound...])
-            let lines = event.split(separator: "\n", omittingEmptySubsequences: false)
-            var payload = ""
-            for line in lines {
-                let s = line.trimmingCharacters(in: .whitespaces)
-                if s.hasPrefix("data: ") {
-                    payload += (payload.isEmpty ? "" : "\n") + String(s.dropFirst(6))
-                }
-            }
-            if !payload.isEmpty {
-                onChunk?(payload)
-            }
+            processSSEEvent(eventBlock)
         }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if !buffer.isEmpty {
             let lines = buffer.split(separator: "\n", omittingEmptySubsequences: false)
+            var eventType: String?
             var payload = ""
             for line in lines {
                 let s = String(line).trimmingCharacters(in: .whitespaces)
-                if s.hasPrefix("data: ") {
+                if s.hasPrefix("event: ") {
+                    eventType = String(s.dropFirst(7))
+                } else if s.hasPrefix("data: ") {
                     payload += (payload.isEmpty ? "" : "\n") + String(s.dropFirst(6))
                 }
             }
-            if !payload.isEmpty { onChunk?(payload) }
+            if !payload.isEmpty {
+                if eventType == "thinking" {
+                    onThinkingChunk?(payload)
+                } else {
+                    onChunk?(payload)
+                }
+            }
         }
         onComplete?(error)
         clearCallbacks()

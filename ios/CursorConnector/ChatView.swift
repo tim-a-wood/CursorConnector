@@ -122,10 +122,18 @@ struct ChatView: View {
             prompt: text,
             host: host,
             port: port,
+            streamThinking: true,
             onChunk: { chunk in
                 Task { @MainActor in
                     if let idx = messages.firstIndex(where: { $0.id == assistantMsgId }) {
                         messages[idx].content += chunk
+                    }
+                }
+            },
+            onThinkingChunk: { chunk in
+                Task { @MainActor in
+                    if let idx = messages.firstIndex(where: { $0.id == assistantMsgId }) {
+                        messages[idx].thinking += chunk
                     }
                 }
             },
@@ -186,7 +194,26 @@ struct ChatBubbleView: View {
                     Text(message.content)
                         .textSelection(.enabled)
                 } else {
-                    StructuredAgentOutputView(output: message.content)
+                    VStack(alignment: .leading, spacing: 12) {
+                        if !message.thinking.isEmpty {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label("Thought process", systemImage: "brain.head.profile")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                                    .foregroundStyle(.secondary)
+                                Text(message.thinking)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.primary.opacity(0.04))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                        StructuredAgentOutputView(output: message.content)
+                    }
                 }
             }
             .padding(.horizontal, 14)

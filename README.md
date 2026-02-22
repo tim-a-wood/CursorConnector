@@ -80,6 +80,13 @@ iOS device and Mac must be on the same LAN (or reachable via VPN/Tailscale). Use
 5. **Mac firewall** — If you have a firewall on, allow incoming connections for the Companion (or allow port 9283). System Settings → Network → Firewall (or Security & Privacy → Firewall) → Options, and add the Companion app or allow incoming on port 9283.
 6. **Test from Mac** — In Terminal on the Mac run: `curl -s http://localhost:9283/health` — you should see `OK`. Then from another machine on the same network: `curl -s http://YOUR_MAC_IP:9283/health`.
 
+### Connection when the display is off (battery saving)
+
+The Companion prevents **system** idle sleep so the Mac stays reachable, but allows the **display** to sleep to save battery. If the connection still drops when your Mac’s screen times out, try:
+
+- **System Settings → Lock Screen** (or **Battery**): enable **“Prevent automatic sleeping when the display is off”** (or the equivalent on your macOS version). The display can still turn off; the Mac stays awake so the iOS app can reconnect.
+- The iOS app will show “Mac unreachable. Reconnecting…” and retry every few seconds; when the Mac is reachable again (e.g. after you wake it), it reconnects automatically.
+
 ## Roadmap
 
 | Phase | Focus |

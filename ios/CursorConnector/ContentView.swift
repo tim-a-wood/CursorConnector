@@ -103,10 +103,11 @@ struct ContentView: View {
     }
 
     /// Polls /health. When unreachable, sets serverReachable = false and retries every 5s until reachable again.
+    /// Shorter interval when reachable keeps traffic flowing so the Mac’s network is less likely to drop when display sleeps.
     private func connectionMonitorLoop() async {
         guard !host.isEmpty else { return }
-        let intervalReachable: UInt64 = 25_000_000_000   // 25s when connected
-        let intervalReconnecting: UInt64 = 5_000_000_000  // 5s when reconnecting
+        let intervalReachable: UInt64 = 12_000_000_000   // 12s when connected (keeps connection active)
+        let intervalReconnecting: UInt64 = 5_000_000_000 // 5s when reconnecting
         while !Task.isCancelled {
             let ok = await CompanionAPI.health(host: host, port: portInt)
             await MainActor.run {

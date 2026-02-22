@@ -15,6 +15,7 @@ struct GitView: View {
     @State private var pushing = false
     @State private var actionMessage: String?
     @State private var actionError: String?
+    @State private var selectedChange: CompanionAPI.GitChangeEntry?
 
     private var hasChanges: Bool { status.map { !$0.changes.isEmpty } ?? false }
 
@@ -54,6 +55,17 @@ struct GitView: View {
                         Text(change.path)
                             .font(.system(.body, design: .monospaced))
                             .lineLimit(2)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        selectedChange = change
+                    }
+                    .contextMenu {
+                        Button {
+                            selectedChange = change
+                        } label: {
+                            Label("View diff", systemImage: "doc.diff")
+                        }
                     }
                 }
             } header: {
@@ -127,6 +139,9 @@ struct GitView: View {
             }
         }
         .navigationTitle("Git")
+        .navigationDestination(item: $selectedChange) { change in
+            GitDiffLoaderView(projectPath: projectPath, host: host, port: port, filePath: change.path)
+        }
         .task {
             await loadStatus()
         }

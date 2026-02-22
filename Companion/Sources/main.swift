@@ -262,6 +262,111 @@ private func sseData(_ text: String) -> Data {
     return Data(out.utf8)
 }
 
+/// SSE event with optional type (e.g. "thinking") so the client can show thought process separately.
+private func sseEvent(event: String?, data: String) -> Data {
+    var out = ""
+    if let e = event, !e.isEmpty {
+        out += "event: " + e + "\n"
+    }
+    let lines = data.split(separator: "\n", omittingEmptySubsequences: false)
+    for line in lines {
+        out += "data: " + line + "\n"
+    }
+    out += "\n"
+    return Data(out.utf8)
+}
+
+/// Runs the agent with --output-format stream-json --stream-partial-output, parses JSON lines and forwards as SSE (event: thinking vs data).
+func runAgentPromptStreamJSONSync(path: String, prompt: String, writeChunk: (Data) throws -> Void) -> Int32 {
+    guard !path.isEmpty, path.hasPrefix("/") else { return -1 }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return -1 }
+    guard !prompt.isEmpty else { return -1 }
+
+    patchCLIConfigToAuto()
+
+    let process = Process()
+    let streamJSONArgs = ["--model", "auto", "-p", "--force", "--trust", "--output-format", "stream-json", "--stream-partial-output", prompt]
+    if let agentPath = agentExecutablePath {
+        process.executableURL = URL(fileURLWithPath: agentPath)
+        process.arguments = streamJSONArgs
+    } else {
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["agent"] + streamJSONArgs
+    }
+    process.currentDirectoryURL = URL(fileURLWithPath: path)
+    process.environment = agentEnvironment()
+
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+
+    do {
+        try process.run()
+    } catch {
+        try? writeChunk(sseData("Error: \(error.localizedDescription)"))
+        return -1
+    }
+
+    let outHandle = outPipe.fileHandleForReading
+    var lineBuffer = ""
+    var totalBytes = 0
+    let deadline = Date().addingTimeInterval(agentTimeoutSeconds)
+
+    while Date() < deadline {
+        let d = outHandle.availableData
+        if d.isEmpty { break }
+        totalBytes += d.count
+        if totalBytes > agentMaxOutputBytes { break }
+        guard let s = String(data: d, encoding: .utf8) else { continue }
+        lineBuffer += s
+        while let newlineIdx = lineBuffer.firstIndex(of: "\n") {
+            let line = String(lineBuffer[..<newlineIdx]).trimmingCharacters(in: .whitespaces)
+            lineBuffer = String(lineBuffer[lineBuffer.index(after: newlineIdx)...])
+            guard !line.isEmpty else { continue }
+            guard let jsonData = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+                try? writeChunk(sseData(line))
+                continue
+            }
+            let eventType: String? = {
+                if let t = obj["type"] as? String {
+                    if t.contains("thinking") || t == "reasoning" { return "thinking" }
+                    return nil
+                }
+                if let k = obj["kind"] as? String, k.contains("thinking") { return "thinking" }
+                return nil
+            }()
+            let payload: String = {
+                if let delta = obj["delta"] as? String { return delta }
+                if let text = obj["text"] as? String { return text }
+                if let content = obj["content"] as? String { return content }
+                if let data = obj["data"] as? String { return data }
+                return line
+            }()
+            if !payload.isEmpty {
+                try? writeChunk(sseEvent(event: eventType, data: payload))
+            }
+        }
+    }
+
+    if Date() >= deadline {
+        process.terminate()
+        process.waitUntilExit()
+        try? writeChunk(sseData("Error: Agent timed out after \(Int(agentTimeoutSeconds)) seconds."))
+        return -1
+    }
+
+    process.waitUntilExit()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    if !errData.isEmpty, let errStr = String(data: errData.prefix(agentMaxOutputBytes), encoding: .utf8) {
+        try? writeChunk(sseEvent(event: nil, data: "\n--- stderr ---\n" + errStr))
+    }
+    try? writeChunk(sseData("\n[exit: \(process.terminationStatus)]"))
+    return process.terminationStatus
+}
+
 // MARK: - File tree and content (Phase 3)
 
 struct FileTreeEntry: Codable {
@@ -408,6 +513,36 @@ func getGitStatus(path: String) -> GitStatusResponse? {
     return GitStatusResponse(branch: branch, changes: changes)
 }
 
+/// Returns the diff for a single file. repoPath is the repo root; filePath is relative to it.
+/// For tracked files uses `git diff HEAD -- <file>`. For untracked, uses `git diff --no-index /dev/null <absPath>`.
+func getGitFileDiff(repoPath: String, filePath: String) -> String? {
+    guard isGitRepo(path: repoPath) else { return nil }
+    let normalizedRepo = (repoPath as NSString).standardizingPath
+    let trimmed = filePath.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, !trimmed.contains(".."), !trimmed.hasPrefix("/") else { return nil }
+    let fullPath = (normalizedRepo as NSString).appendingPathComponent(trimmed)
+    let resolvedFull = (fullPath as NSString).standardizingPath
+    guard resolvedFull.hasPrefix(normalizedRepo) else { return nil }
+
+    // Tracked file: diff vs HEAD (staged + unstaged)
+    let (out, _, code) = runGit(in: normalizedRepo, arguments: ["diff", "HEAD", "--", trimmed])
+    if code == 0 {
+        if !out.isEmpty { return out }
+        // Empty diff: if tracked, return empty; if untracked, fall through to show new file
+        let (_, _, lsExit) = runGit(in: normalizedRepo, arguments: ["ls-files", "--error-unmatch", "--", trimmed])
+        if lsExit == 0 { return "" }  // tracked, no changes
+    }
+
+    // Untracked: show as new file via diff --no-index
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: resolvedFull, isDirectory: &isDir), !isDir.boolValue else {
+        return nil
+    }
+    let (untrackedOut, _, untrackedCode) = runGit(in: normalizedRepo, arguments: ["diff", "--no-index", "/dev/null", resolvedFull])
+    if untrackedCode == 0 { return untrackedOut }
+    return nil
+}
+
 struct GitGenerateMessageResponse: Codable {
     var message: String
 }
@@ -452,6 +587,8 @@ func gitPush(path: String) -> (success: Bool, output: String, error: String) {
 }
 
 // MARK: - Sleep prevention (release on exit)
+// Prevent system idle sleep only (display can sleep to save battery). If the connection still drops when the
+// screen is off, the user can enable "Prevent automatic sleeping when the display is off" in System Settings.
 
 private var g_sleepAssertionID: IOPMAssertionID = 0
 
@@ -567,6 +704,7 @@ server.POST["/prompt-stream"] = { request in
     }
     let path = decoded.path
     let prompt = decoded.prompt
+    let streamJSON = request.queryParams.first(where: { $0.0 == "stream" })?.1 == "json"
     let headers: [String: String] = [
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -578,8 +716,15 @@ server.POST["/prompt-stream"] = { request in
             try writer.write(sseData("Error: Invalid path or empty prompt"))
             return
         }
-        let exitCode = runAgentPromptStreamSync(path: path, prompt: prompt) { chunk in
-            try writer.write(chunk)
+        let exitCode: Int32
+        if streamJSON {
+            exitCode = runAgentPromptStreamJSONSync(path: path, prompt: prompt) { chunk in
+                try writer.write(chunk)
+            }
+        } else {
+            exitCode = runAgentPromptStreamSync(path: path, prompt: prompt) { chunk in
+                try writer.write(chunk)
+            }
         }
         if exitCode == 127 {
             try? writer.write(sseData("The 'agent' command was not found (exit code 127). Install the Cursor Agent CLI on your Mac:\n\n  curl https://cursor.com/install -fsSL | bash\n\nThen restart the Companion and try again."))
@@ -599,6 +744,28 @@ server.GET["/git/status"] = { request in
         return .badRequest(.text("Not a git repository"))
     }
     guard let data = try? JSONEncoder().encode(status) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
+struct GitDiffResponse: Codable {
+    var diff: String
+}
+
+server.GET["/git/diff"] = { request in
+    guard let pathParam = request.queryParams.first(where: { $0.0 == "path" })?.1,
+          let path = pathParam.removingPercentEncoding,
+          !path.isEmpty, path.hasPrefix("/"), !path.contains("..") else {
+        return .badRequest(.text("Missing or invalid 'path' query parameter"))
+    }
+    guard let fileParam = request.queryParams.first(where: { $0.0 == "file" })?.1,
+          let file = fileParam.removingPercentEncoding, !file.isEmpty else {
+        return .badRequest(.text("Missing or invalid 'file' query parameter"))
+    }
+    guard let diff = getGitFileDiff(repoPath: path, filePath: file) else {
+        return .badRequest(.text("No diff available for that file"))
+    }
+    let response = GitDiffResponse(diff: diff)
+    guard let data = try? JSONEncoder().encode(response) else { return .internalServerError }
     return .ok(.data(data, contentType: "application/json"))
 }
 
@@ -899,17 +1066,16 @@ server.POST["/xcode-build"] = { request in
 do {
     try server.start(port)
 
-    // Prevent Mac from idle-sleeping so the iOS app can stay connected (e.g. when lid is closed but user expects connection).
+    // Prevent system idle sleep only (display may sleep to save battery). Keeps Mac reachable for the iOS app.
     let reason = "Cursor Connector Companion server" as CFString
-    let success = IOPMAssertionCreateWithName(
+    if IOPMAssertionCreateWithName(
         kIOPMAssertPreventUserIdleSystemSleep as CFString,
         IOPMAssertionLevel(kIOPMAssertionLevelOn),
         reason,
         &g_sleepAssertionID
-    )
-    if success == kIOReturnSuccess {
+    ) == kIOReturnSuccess {
         atexit(releaseSleepAssertion)
-        print("Sleep prevention active (Mac will not idle-sleep while Companion is running).")
+        print("Sleep prevention active (system will not idle-sleep; display may sleep to save battery).")
     }
 
     print("CursorConnector Companion running on http://localhost:\(port)")
@@ -922,6 +1088,7 @@ do {
     print("  POST /prompt        - run agent (body: {\"path\": \"/project/path\", \"prompt\": \"...\"})")
     print("  POST /prompt-stream - run agent with SSE streaming output")
     print("  GET  /git/status    - git status (query: path=...)")
+    print("  GET  /git/diff     - file diff (query: path=..., file=...)")
     print("  POST /git/generate-message - generate commit message (body: {\"path\": \"...\"})")
     print("  POST /git/commit    - git add -A && commit (body: {\"path\": \"...\", \"message\": \"...\"})")
     print("  POST /git/push     - git push (body: {\"path\": \"...\"})")
