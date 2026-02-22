@@ -134,7 +134,7 @@ private func patchCLIConfigToAuto() {
     config["model"] = model
     config["hasChangedDefaultModel"] = true
     guard let out = try? JSONSerialization.data(withJSONObject: config),
-          let _ = try? String(data: out, encoding: .utf8) else { return }
+          let _ = String(data: out, encoding: .utf8) else { return }
     try? out.write(to: configURL)
 }
 
@@ -641,25 +641,33 @@ let xcodeBuildTimeoutSeconds: TimeInterval = 300
 let xcodeSchemeName = "CursorConnector"
 let xcodeProjectName = "CursorConnector.xcodeproj"
 let xcodeProductName = "CursorConnector.app"
+let xcodeBundleId = "com.cursorconnector.app"
 
-/// Resolve path to the iOS Xcode project. Uses optional repoPath from request, else current directory + "/ios".
+/// Resolve path to the iOS Xcode project directory (ios/). Uses optional repoPath from request, else current directory or its parent (so running from Companion/ works).
 func resolveIOSProjectPath(repoPath: String?) -> String? {
-    let base: String
+    let candidates: [String]
     if let r = repoPath?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty {
-        base = (r as NSString).standardizingPath
+        candidates = [(r as NSString).standardizingPath]
     } else {
-        base = FileManager.default.currentDirectoryPath
+        let cwd = FileManager.default.currentDirectoryPath
+        let parent = (cwd as NSString).deletingLastPathComponent
+        candidates = [cwd, parent]
     }
-    let iosDir = (base as NSString).appendingPathComponent("ios")
-    let projectPath = (iosDir as NSString).appendingPathComponent(xcodeProjectName)
-    var isDir: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: projectPath, isDirectory: &isDir), isDir.boolValue else {
-        return nil
+    for base in candidates {
+        let iosDir = (base as NSString).appendingPathComponent("ios")
+        let projectPath = (iosDir as NSString).appendingPathComponent(xcodeProjectName)
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: projectPath, isDirectory: &isDir), isDir.boolValue {
+            return iosDir
+        }
     }
-    return iosDir
+    return nil
 }
 
+let deviceListTimeoutSeconds: TimeInterval = 90
+
 /// Run xcodebuild -showdestinations and return the first connected iOS device id.
+/// Parses output like: { platform:iOS, arch:arm64, id:00008140-..., name:iPhone }
 func getFirstConnectedDeviceID(projectPath: String) -> String? {
     let projectFile = (projectPath as NSString).appendingPathComponent(xcodeProjectName)
     let process = Process()
@@ -671,27 +679,33 @@ func getFirstConnectedDeviceID(projectPath: String) -> String? {
     process.standardError = FileHandle.nullDevice
     do {
         try process.run()
-        process.waitUntilExit()
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            process.waitUntilExit()
+            group.leave()
+        }
+        guard group.wait(timeout: .now() + deviceListTimeoutSeconds) == .success else {
+            process.terminate()
+            process.waitUntilExit()
+            return nil
+        }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let out = String(data: data, encoding: .utf8) else { return nil }
-        var currentId: String?
-        var currentType: String?
-        var isDevice = false
         for line in out.split(separator: "\n") {
             let s = line.trimmingCharacters(in: .whitespaces)
-            if s.hasPrefix("id = ") {
-                currentId = String(s.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            } else if s.hasPrefix("destinationType = ") {
-                currentType = String(s.dropFirst(17)).trimmingCharacters(in: .whitespaces)
-                isDevice = (currentType == "device")
-            } else if s.hasPrefix("platform = ") {
-                let platform = String(s.dropFirst(10)).trimmingCharacters(in: .whitespaces)
-                if isDevice, platform == "iOS", let id = currentId, !id.isEmpty {
-                    return id
+            // Match physical device: "platform:iOS," (not "platform:iOS Simulator")
+            guard s.contains("platform:iOS,"), !s.contains("platform:iOS Simulator") else { continue }
+            guard !s.contains("placeholder") else { continue }
+            // Extract id:UUID (id is hex digits and hyphens)
+            if let idRange = s.range(of: "id:") {
+                let afterPrefix = s[idRange.upperBound...]
+                if let endIdx = afterPrefix.firstIndex(where: { $0 == "," || $0 == " " || $0 == "}" }) {
+                    let id = String(afterPrefix[..<endIdx]).trimmingCharacters(in: .whitespaces)
+                    if !id.isEmpty, id.contains("-") {
+                        return id
+                    }
                 }
-                currentId = nil
-                currentType = nil
-                isDevice = false
             }
         }
         return nil
@@ -728,19 +742,46 @@ func runXcodeBuildAndInstall(projectPath: String, deviceId: String) -> (output: 
     } catch {
         return ("Error: \(error.localizedDescription)", -1)
     }
+    // Drain pipes in background so xcodebuild doesn't block when buffers fill
+    var outData = Data()
+    var errData = Data()
+    let drainQueue = DispatchQueue(label: "xcodebuild-drain")
+    let outHandle = outPipe.fileHandleForReading
+    let errHandle = errPipe.fileHandleForReading
+    outHandle.readabilityHandler = { h in
+        let d = h.availableData
+        if !d.isEmpty { drainQueue.sync { outData.append(d) } }
+    }
+    errHandle.readabilityHandler = { h in
+        let d = h.availableData
+        if !d.isEmpty { drainQueue.sync { errData.append(d) } }
+    }
     let group = DispatchGroup()
     group.enter()
     DispatchQueue.global(qos: .userInitiated).async {
         buildProcess.waitUntilExit()
+        outHandle.readabilityHandler = nil
+        errHandle.readabilityHandler = nil
         group.leave()
     }
     if group.wait(timeout: .now() + xcodeBuildTimeoutSeconds) == .timedOut {
         buildProcess.terminate()
         buildProcess.waitUntilExit()
+        outHandle.readabilityHandler = nil
+        errHandle.readabilityHandler = nil
+        try? outHandle.close()
+        try? errHandle.close()
         return ("Error: Build timed out after \(Int(xcodeBuildTimeoutSeconds)) seconds.", -1)
     }
-    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    // Read any remaining data before closing (availableData throws if handle already closed)
+    drainQueue.sync {
+        let remainingOut = outHandle.availableData
+        let remainingErr = errHandle.availableData
+        if !remainingOut.isEmpty { outData.append(remainingOut) }
+        if !remainingErr.isEmpty { errData.append(remainingErr) }
+    }
+    try? outHandle.close()
+    try? errHandle.close()
     let outStr = String(data: outData, encoding: .utf8) ?? ""
     let errStr = String(data: errData, encoding: .utf8) ?? ""
     let buildOutput = errStr.isEmpty ? outStr : "\(outStr)\n\(errStr)"
@@ -774,7 +815,30 @@ func runXcodeBuildAndInstall(projectPath: String, deviceId: String) -> (output: 
     if installProcess.terminationStatus != 0 {
         return (buildOutput + "\n--- Install failed ---\n" + installLog, installProcess.terminationStatus)
     }
-    return (buildOutput + "\n--- Installed on device ---\n" + installLog, 0)
+
+    // Launch the app on the device so it reopens after install (user may have had it open; install replaces it).
+    let launchProcess = Process()
+    launchProcess.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    launchProcess.arguments = ["devicectl", "device", "process", "launch", "--device", deviceId, xcodeBundleId]
+    let launchOut = Pipe()
+    let launchErr = Pipe()
+    launchProcess.standardOutput = launchOut
+    launchProcess.standardError = launchErr
+    var launchNote = "--- Installed on device ---"
+    do {
+        try launchProcess.run()
+        launchProcess.waitUntilExit()
+        let outStr = String(data: launchOut.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let errStr = String(data: launchErr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if launchProcess.terminationStatus == 0 {
+            launchNote += "\n--- App launched on device ---"
+        } else {
+            launchNote += "\n--- Install OK; launch failed: \(errStr.isEmpty ? outStr : errStr) ---"
+        }
+    } catch {
+        launchNote += "\n--- Install OK; launch failed: \(error.localizedDescription) ---"
+    }
+    return (buildOutput + "\n" + launchNote + "\n" + installLog, 0)
 }
 
 struct XcodeBuildRequest: Codable {
@@ -787,23 +851,30 @@ struct XcodeBuildResponse: Codable {
     var error: String
 }
 
-server.POST["/xcode/build"] = { request in
+// If the client disconnects before the build finishes (e.g. timeout), Swifter may log "Failed to send response: writeFailed(\"Broken pipe\")". The build can still have succeeded.
+server.POST["/xcode-build"] = { request in
     var repoPath: String?
     if !request.body.isEmpty,
        let decoded = try? JSONDecoder().decode(XcodeBuildRequest.self, from: Data(request.body)) {
         repoPath = decoded.repoPath
     }
+    print("[xcode-build] Resolving project path...")
     guard let projectPath = resolveIOSProjectPath(repoPath: repoPath) else {
         let bodyDict: [String: Any] = ["success": false, "output": "", "error": "iOS project not found. Run Companion from the CursorConnector repo root, or send repoPath in the request body."]
         guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
         return .ok(.data(data, contentType: "application/json"))
     }
+    print("[xcode-build] Project: \(projectPath)")
+    print("[xcode-build] Finding device (xcodebuild -showdestinations, may take 20–30s)...")
     guard let deviceId = getFirstConnectedDeviceID(projectPath: projectPath) else {
         let bodyDict: [String: Any] = ["success": false, "output": "", "error": "No connected iOS device found. Connect your iPhone and ensure it is trusted."]
         guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
         return .ok(.data(data, contentType: "application/json"))
     }
+    print("[xcode-build] Device: \(deviceId)")
+    print("[xcode-build] Running xcodebuild + install (command line, not in Xcode app)...")
     let (output, exitCode) = runXcodeBuildAndInstall(projectPath: projectPath, deviceId: deviceId)
+    print("[xcode-build] Done, exit code \(exitCode)")
     let bodyDict: [String: Any] = [
         "success": exitCode == 0,
         "output": output,
@@ -828,7 +899,7 @@ do {
     print("  POST /git/generate-message - generate commit message (body: {\"path\": \"...\"})")
     print("  POST /git/commit    - git add -A && commit (body: {\"path\": \"...\", \"message\": \"...\"})")
     print("  POST /git/push     - git push (body: {\"path\": \"...\"})")
-    print("  POST /xcode/build  - build iOS app and install to connected device (body: optional {\"repoPath\": \"/path\"})")
+    print("  POST /xcode-build  - build iOS app and install to connected device (body: optional {\"repoPath\": \"/path\"})")
     print("  POST /restart       - exit process (use with a restarter script to restart)")
     RunLoop.main.run()
 } catch {

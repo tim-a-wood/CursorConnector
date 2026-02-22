@@ -14,75 +14,16 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
+            VStack(spacing: 0) {
+                toolbarButtonRow(project: selectedProject)
                 if let project = selectedProject {
                     ChatView(project: project, host: host, port: portInt, messages: $messages)
-                        .toolbar {
-                            ToolbarItem(placement: .topBarLeading) {
-                                NavigationLink {
-                                    FileBrowserView(projectPath: project.path, host: host, port: portInt)
-                                } label: {
-                                    Label("Files", systemImage: "folder")
-                                }
-                            }
-                            ToolbarItem(placement: .topBarLeading) {
-                                NavigationLink {
-                                    GitView(projectPath: project.path, host: host, port: portInt)
-                                } label: {
-                                    Label("Git", systemImage: "vault")
-                                }
-                            }
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button {
-                                    triggerBuild()
-                                } label: {
-                                    if isBuilding {
-                                        ProgressView()
-                                            .scaleEffect(0.8)
-                                    } else {
-                                        Label("Build", systemImage: "hammer")
-                                    }
-                                }
-                                .disabled(isBuilding || host.isEmpty)
-                            }
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button {
-                                    showConfig = true
-                                } label: {
-                                    Label("Settings", systemImage: "gearshape")
-                                }
-                            }
-                        }
                 } else {
                     emptyState
                 }
             }
             .navigationTitle(selectedProject != nil ? (selectedProject!.label ?? (selectedProject!.path as NSString).lastPathComponent) : "Cursor")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                if selectedProject == nil {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            triggerBuild()
-                        } label: {
-                            if isBuilding {
-                                ProgressView()
-                                    .scaleEffect(0.8)
-                            } else {
-                                Label("Build", systemImage: "hammer")
-                            }
-                        }
-                        .disabled(isBuilding || host.isEmpty)
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button {
-                            showConfig = true
-                        } label: {
-                            Label("Settings", systemImage: "gearshape")
-                        }
-                    }
-                }
-            }
             .sheet(isPresented: $showConfig) {
                 ConfigView(host: $host, port: $port, selectedProject: $selectedProject)
                     .onDisappear {
@@ -99,6 +40,43 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func toolbarButtonRow(project: ProjectEntry?) -> some View {
+        HStack(spacing: 16) {
+            if let project = project {
+                NavigationLink {
+                    FileBrowserView(projectPath: project.path, host: host, port: portInt)
+                } label: {
+                    Label("Files", systemImage: "folder")
+                }
+                NavigationLink {
+                    GitView(projectPath: project.path, host: host, port: portInt)
+                } label: {
+                    Label("Git", systemImage: "vault")
+                }
+            }
+            Spacer()
+            Button {
+                triggerBuild()
+            } label: {
+                if isBuilding {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                } else {
+                    Label("Build", systemImage: "hammer")
+                }
+            }
+            .disabled(isBuilding || host.isEmpty)
+            Button {
+                showConfig = true
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 8)
     }
 
     private func triggerBuild() {
@@ -120,7 +98,7 @@ struct ContentView: View {
             } catch {
                 await MainActor.run {
                     isBuilding = false
-                    buildAlertMessage = error.localizedDescription
+                    buildAlertMessage = "Could not reach Mac: \(error.localizedDescription)\n\nIn Settings, set Host to your Mac’s IP (e.g. 192.168.1.x). iPhone and Mac must be on the same Wi‑Fi."
                     showBuildAlert = true
                 }
             }

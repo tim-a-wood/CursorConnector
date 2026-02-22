@@ -294,7 +294,7 @@ enum CompanionAPI {
     /// Triggers a build of the CursorConnector iOS app on the Mac and installs to the first connected device.
     static func buildXcode(repoPath: String? = nil, host: String, port: Int = defaultPort) async throws -> XcodeBuildResponse {
         guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
-        let url = base.appendingPathComponent("xcode/build")
+        let url = base.appendingPathComponent("xcode-build")
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = buildTimeout
