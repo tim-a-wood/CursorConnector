@@ -1,0 +1,58 @@
+# Run the unit test suite on push to main. Tuned to reduce GitHub Actions minutes:
+# - Path filter: only runs when app/test/project files change (skips docs-only pushes).
+# - Caches Xcode DerivedData to shorten rebuilds.
+# Requires: Xcode project with a shared scheme named "CursorConnector".
+# See .github/ACTIONS_BILLING.md for more ways to avoid spending limits.
+
+name: Test
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/**'
+      - 'ios/**'
+      - 'Companion/**'
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Xcode DerivedData
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Developer/Xcode/DerivedData
+          key: xcode-deriveddata-${{ runner.os }}-${{ hashFiles('ios/project.yml', 'ios/CursorConnector/**/*.swift') }}
+          restore-keys: |
+            xcode-deriveddata-${{ runner.os }}-
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+
+      - name: Companion – build and test
+        run: |
+          swift build
+          swift test
+        working-directory: Companion
+
+      - name: iOS – run tests
+        run: |
+          xcodebuild test \
+            -project ios/CursorConnector.xcodeproj \
+            -scheme CursorConnector \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            -quiet
+        working-directory: ${{ github.workspace }}
+        continue-on-error: true  # Set to false once an iOS test target is added
+
+      - name: Upload test results (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TestResults
+          path: ${{ github.workspace }}/TestResults.xcresult
+          retention-days: 5
