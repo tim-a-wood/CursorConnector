@@ -22,7 +22,15 @@ struct GitView: View {
     @State private var actionsSectionExpanded = false
 
     private var hasChanges: Bool { status.map { !$0.changes.isEmpty } ?? false }
-    private var mostRecentRun: CompanionAPI.GitHubActionsRun? { actionsResponse?.runs.first }
+
+    /// Status for the title bar: reflects the latest run only (first in list; API returns most recent first). In progress if any run is still running.
+    private var overallActionsResult: (conclusion: String?, status: String)? {
+        guard let runs = actionsResponse?.runs, !runs.isEmpty else { return nil }
+        let anyInProgress = runs.contains { $0.status == "in_progress" || $0.status == "queued" }
+        if anyInProgress { return (nil, "in_progress") }
+        let latest = runs[0]
+        return (latest.conclusion, latest.status)
+    }
 
     var body: some View {
         List {
@@ -55,9 +63,9 @@ struct GitView: View {
                     Text("GitHub Actions")
                         .font(.subheadline.weight(.medium))
                     Spacer()
-                    if let run = mostRecentRun {
-                        Image(systemName: iconForActionsConclusion(run.conclusion, status: run.status))
-                            .foregroundStyle(colorForActionsConclusion(run.conclusion, status: run.status))
+                    if let overall = overallActionsResult {
+                        Image(systemName: iconForActionsConclusion(overall.conclusion, status: overall.status))
+                            .foregroundStyle(colorForActionsConclusion(overall.conclusion, status: overall.status))
                             .font(.caption)
                     } else if actionsLoading {
                         ProgressView()
@@ -67,6 +75,15 @@ struct GitView: View {
                             .foregroundStyle(.secondary)
                             .font(.caption)
                     }
+                    Button {
+                        Task { await loadGitHubActions() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(actionsLoading)
                     Button {
                         withAnimation(.easeInOut(duration: 0.2)) { actionsSectionExpanded.toggle() }
                     } label: {
