@@ -289,18 +289,28 @@ enum CompanionAPI {
         }
     }
 
+    struct GitDiffRequest: Codable {
+        var path: String
+        var file: String
+    }
+
     struct GitDiffResponse: Codable {
         var diff: String
     }
 
     static func fetchGitDiff(path: String, file: String, host: String, port: Int = defaultPort) async throws -> String {
         try await withRetry {
-            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
-            var components = URLComponents(url: base.appendingPathComponent("git/diff"), resolvingAgainstBaseURL: false)!
-            components.queryItems = [URLQueryItem(name: "path", value: path), URLQueryItem(name: "file", value: file)]
+            var components = URLComponents()
+            components.scheme = "http"
+            components.host = host
+            components.port = port
+            components.path = "/api/git-diff"
             guard let url = components.url else { throw URLError(.badURL) }
             var request = URLRequest(url: url)
+            request.httpMethod = "POST"
             request.timeoutInterval = fileRequestTimeout
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(GitDiffRequest(path: path, file: file))
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
             guard http.statusCode == 200 else {

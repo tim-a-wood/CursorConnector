@@ -496,15 +496,19 @@ func getGitStatus(path: String) -> GitStatusResponse? {
     let (branchOut, _, branchCode) = runGit(in: path, arguments: ["rev-parse", "--abbrev-ref", "HEAD"])
     var branch = branchCode == 0 ? branchOut.trimmingCharacters(in: .whitespacesAndNewlines) : ""
     if branch.isEmpty { branch = "HEAD" }
-    let (statusOut, _, statusCode) = runGit(in: path, arguments: ["status", "--porcelain", "-z"])
+    // Use newline-separated (no -z) so parsing is straightforward: "XY path" per line
+    let (statusOut, _, statusCode) = runGit(in: path, arguments: ["status", "--porcelain"])
     var changes: [GitChangeEntry] = []
     if statusCode == 0, !statusOut.isEmpty {
-        let parts = statusOut.split(separator: "\0", omittingEmptySubsequences: false)
-        for part in parts {
+        let lines = statusOut.split(separator: "\n", omittingEmptySubsequences: false)
+        for part in lines {
             let line = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard line.count >= 4 else { continue }
+            guard line.count >= 3 else { continue }
             let status = String(line.prefix(2)).trimmingCharacters(in: .whitespaces)
-            let filePath = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            // Path is everything after the 2-char status and exactly one separator (space or tab)
+            let afterStatus = line.dropFirst(2)
+            let pathStart = afterStatus.drop(while: { $0 == " " || $0 == "\t" })
+            let filePath = String(pathStart).trimmingCharacters(in: .whitespacesAndNewlines)
             if !filePath.isEmpty {
                 changes.append(GitChangeEntry(status: status.isEmpty ? "??" : status, path: filePath))
             }
@@ -539,8 +543,15 @@ func getGitFileDiff(repoPath: String, filePath: String) -> String? {
         return nil
     }
     let (untrackedOut, _, untrackedCode) = runGit(in: normalizedRepo, arguments: ["diff", "--no-index", "/dev/null", resolvedFull])
-    if untrackedCode == 0 { return untrackedOut }
-    return nil
+    if untrackedCode == 0, !untrackedOut.isEmpty { return untrackedOut }
+
+    // Fallback for new files when git diff --no-index fails or is empty: show full file as added lines
+    guard let result = readFileContent(path: resolvedFull), let content = result.content, !result.binary else {
+        return nil
+    }
+    let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
+    let diffLines = lines.map { "+ " + $0 }
+    return "--- /dev/null\n+++ b/\(trimmed)\n" + diffLines.joined(separator: "\n")
 }
 
 struct GitGenerateMessageResponse: Codable {
@@ -751,23 +762,57 @@ struct GitDiffResponse: Codable {
     var diff: String
 }
 
-server.GET["/git/diff"] = { request in
+let gitDiffHandler: (HttpRequest) -> HttpResponse = { request in
     guard let pathParam = request.queryParams.first(where: { $0.0 == "path" })?.1,
-          let path = pathParam.removingPercentEncoding,
-          !path.isEmpty, path.hasPrefix("/"), !path.contains("..") else {
+          let pathDecoded = pathParam.removingPercentEncoding,
+          !pathDecoded.isEmpty, !pathDecoded.contains("..") else {
         return .badRequest(.text("Missing or invalid 'path' query parameter"))
     }
+    // Repo path must be absolute; allow with or without leading slash
+    let path = pathDecoded.hasPrefix("/") ? pathDecoded : "/" + pathDecoded
     guard let fileParam = request.queryParams.first(where: { $0.0 == "file" })?.1,
           let file = fileParam.removingPercentEncoding, !file.isEmpty else {
         return .badRequest(.text("Missing or invalid 'file' query parameter"))
     }
-    guard let diff = getGitFileDiff(repoPath: path, filePath: file) else {
+    // File must be relative to repo root (no leading slash)
+    let filePath = file.hasPrefix("/") ? String(file.dropFirst()) : file
+    guard let diff = getGitFileDiff(repoPath: path, filePath: filePath) else {
         return .badRequest(.text("No diff available for that file"))
     }
     let response = GitDiffResponse(diff: diff)
     guard let data = try? JSONEncoder().encode(response) else { return .internalServerError }
     return .ok(.data(data, contentType: "application/json"))
 }
+server.GET["/git/diff"] = gitDiffHandler
+server.GET["git/diff"] = gitDiffHandler
+
+struct GitDiffRequest: Codable { var path: String; var file: String }
+
+let gitDiffPostHandler: (HttpRequest) -> HttpResponse = { request in
+    guard !request.body.isEmpty,
+          let decoded = try? JSONDecoder().decode(GitDiffRequest.self, from: Data(request.body)) else {
+        return .badRequest(.text("Missing or invalid JSON body with 'path' and 'file'"))
+    }
+    var path = decoded.path.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !path.isEmpty, !path.contains("..") else {
+        return .badRequest(.text("Invalid 'path'"))
+    }
+    if !path.hasPrefix("/") { path = "/" + path }
+    var filePath = decoded.file.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !filePath.isEmpty else {
+        return .badRequest(.text("Invalid 'file'"))
+    }
+    if filePath.hasPrefix("/") { filePath = String(filePath.dropFirst()) }
+    guard let diff = getGitFileDiff(repoPath: path, filePath: filePath) else {
+        return .badRequest(.text("No diff available for that file"))
+    }
+    let response = GitDiffResponse(diff: diff)
+    guard let data = try? JSONEncoder().encode(response) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+server.POST["/git/diff"] = gitDiffPostHandler
+server.POST["git/diff"] = gitDiffPostHandler
+server.POST["/api/git-diff"] = gitDiffPostHandler
 
 struct GitPathRequest: Codable { var path: String }
 
@@ -1063,6 +1108,11 @@ server.POST["/xcode-build"] = { request in
     return .ok(.data(data, contentType: "application/json"))
 }
 
+server.notFoundHandler = { request in
+    print("[Companion] 404 \(request.method) \(request.path)")
+    return .notFound
+}
+
 do {
     try server.start(port)
 
@@ -1089,6 +1139,7 @@ do {
     print("  POST /prompt-stream - run agent with SSE streaming output")
     print("  GET  /git/status    - git status (query: path=...)")
     print("  GET  /git/diff     - file diff (query: path=..., file=...)")
+    print("  POST /api/git-diff - file diff (body: {\"path\": \"...\", \"file\": \"...\"}) [used by iOS app]")
     print("  POST /git/generate-message - generate commit message (body: {\"path\": \"...\"})")
     print("  POST /git/commit    - git add -A && commit (body: {\"path\": \"...\", \"message\": \"...\"})")
     print("  POST /git/push     - git push (body: {\"path\": \"...\"})")

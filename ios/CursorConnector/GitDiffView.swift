@@ -1,9 +1,36 @@
 import SwiftUI
 
-/// Shows the git diff for a single file (read-only).
+/// Shows the git diff for a single file (read-only), with added/removed line coloring.
 struct GitDiffView: View {
     let filePath: String
     let diff: String
+
+    private struct DiffLine: Identifiable {
+        let id: Int
+        let text: String
+        let kind: LineKind
+    }
+
+    private enum LineKind {
+        case header, added, removed, context
+    }
+
+    private var diffLines: [DiffLine] {
+        diff.split(separator: "\n", omittingEmptySubsequences: false).enumerated().map { index, line in
+            let s = String(line)
+            let kind: LineKind
+            if s.hasPrefix("+++") || s.hasPrefix("---") || s.hasPrefix("@@") {
+                kind = .header
+            } else if s.hasPrefix("+") {
+                kind = .added
+            } else if s.hasPrefix("-") {
+                kind = .removed
+            } else {
+                kind = .context
+            }
+            return DiffLine(id: index, text: s, kind: kind)
+        }
+    }
 
     var body: some View {
         Group {
@@ -12,17 +39,39 @@ struct GitDiffView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                ScrollView([.horizontal, .vertical], showsIndicators: true) {
-                    Text(diff)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
-                        .padding(8)
+                GeometryReader { geometry in
+                    ScrollView(.vertical, showsIndicators: true) {
+                        ScrollView(.horizontal, showsIndicators: true) {
+                            LazyVStack(alignment: .leading, spacing: 0) {
+                                ForEach(diffLines) { line in
+                                    Text(line.text)
+                                        .font(.system(.caption, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 2)
+                                        .background(lineBackground(for: line.kind))
+                                }
+                            }
+                            .frame(minWidth: geometry.size.width)
+                            .padding(8)
+                        }
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .navigationTitle((filePath as NSString).lastPathComponent)
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func lineBackground(for kind: LineKind) -> Color {
+        switch kind {
+        case .header: return Color.clear
+        case .added: return Color.green.opacity(0.12)
+        case .removed: return Color.red.opacity(0.12)
+        case .context: return Color.clear
+        }
     }
 }
 
@@ -69,7 +118,9 @@ struct GitDiffLoaderView: View {
         diff = nil
         defer { loading = false }
         do {
-            let d = try await CompanionAPI.fetchGitDiff(path: projectPath, file: filePath, host: host, port: port)
+            // Server expects file path relative to repo root (no leading slash).
+            let relativePath = filePath.hasPrefix("/") ? String(filePath.dropFirst()) : filePath
+            let d = try await CompanionAPI.fetchGitDiff(path: projectPath, file: relativePath, host: host, port: port)
             await MainActor.run { diff = d }
         } catch {
             await MainActor.run { errorMessage = error.localizedDescription }

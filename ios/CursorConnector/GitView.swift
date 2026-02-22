@@ -47,19 +47,26 @@ struct GitView: View {
 
             Section {
                 ForEach(status?.changes ?? []) { change in
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: iconForStatus(change.status))
-                            .foregroundStyle(colorForStatus(change.status))
-                            .font(.body)
-                            .frame(width: 22, alignment: .center)
-                        Text(change.path)
-                            .font(.system(.body, design: .monospaced))
-                            .lineLimit(2)
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
+                    Button {
                         selectedChange = change
+                    } label: {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: iconForStatus(change.status))
+                                .foregroundStyle(colorForStatus(change.status))
+                                .font(.body)
+                                .frame(width: 24, alignment: .center)
+                            Text(change.path)
+                                .font(.system(.body, design: .monospaced))
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
                     }
+                    .buttonStyle(.plain)
                     .contextMenu {
                         Button {
                             selectedChange = change
