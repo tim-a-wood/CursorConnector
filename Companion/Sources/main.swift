@@ -1,4 +1,5 @@
 import Foundation
+import IOKit.pwr_mgt
 import Swifter
 
 // MARK: - Cursor recent workspaces
@@ -450,6 +451,17 @@ func gitPush(path: String) -> (success: Bool, output: String, error: String) {
     return (code == 0, out, err)
 }
 
+// MARK: - Sleep prevention (release on exit)
+
+private var g_sleepAssertionID: IOPMAssertionID = 0
+
+private func releaseSleepAssertion() {
+    if g_sleepAssertionID != 0 {
+        IOPMAssertionRelease(g_sleepAssertionID)
+        g_sleepAssertionID = 0
+    }
+}
+
 // MARK: - Server
 
 let port: UInt16 = 9283
@@ -886,6 +898,20 @@ server.POST["/xcode-build"] = { request in
 
 do {
     try server.start(port)
+
+    // Prevent Mac from idle-sleeping so the iOS app can stay connected (e.g. when lid is closed but user expects connection).
+    let reason = "Cursor Connector Companion server" as CFString
+    let success = IOPMAssertionCreateWithName(
+        kIOPMAssertPreventUserIdleSystemSleep as CFString,
+        IOPMAssertionLevel(kIOPMAssertionLevelOn),
+        reason,
+        &g_sleepAssertionID
+    )
+    if success == kIOReturnSuccess {
+        atexit(releaseSleepAssertion)
+        print("Sleep prevention active (Mac will not idle-sleep while Companion is running).")
+    }
+
     print("CursorConnector Companion running on http://localhost:\(port)")
     print("  GET  /health        - health check")
     print("  GET  /projects      - list recent Cursor projects")

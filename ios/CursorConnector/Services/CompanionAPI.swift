@@ -72,7 +72,10 @@ enum CompanionAPI {
         return try JSONDecoder().decode(PromptResponse.self, from: data)
     }
 
-    /// Streams agent output via Server-Sent Events. Calls onChunk with each text payload; onComplete when done (error nil or set).
+    /// Called by the app delegate when the system delivers background URLSession events. Set and cleared by UIApplicationDelegate.
+    static var backgroundSessionCompletionHandler: (() -> Void)?
+
+    /// Streams agent output via Server-Sent Events. Uses a background URLSession so the request continues when the app is suspended.
     static func sendPromptStream(
         path: String,
         prompt: String,
@@ -96,12 +99,18 @@ enum CompanionAPI {
             onComplete(error)
             return
         }
-        let delegate = StreamDelegate(onChunk: onChunk, onComplete: onComplete)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
-        let task = session.dataTask(with: request)
-        delegate.task = task
+        streamDelegate.setCallbacks(onChunk: onChunk, onComplete: onComplete)
+        let task = backgroundURLSession.dataTask(with: request)
+        streamDelegate.task = task
         task.resume()
     }
+
+    private static let backgroundSessionIdentifier = "com.cursorconnector.prompt-stream"
+    private static let streamDelegate = StreamDelegate()
+    private static let backgroundURLSession: URLSession = {
+        let config = URLSessionConfiguration.background(withIdentifier: backgroundSessionIdentifier)
+        return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
+    }()
 
     /// Asks the Companion to exit. Only useful when the Companion is run under a restarter (e.g. while true; do swift run; sleep 2; done).
     static func restartServer(host: String, port: Int = defaultPort) async throws {
@@ -318,13 +327,18 @@ private struct XcodeBuildRequest: Codable {
 
 private class StreamDelegate: NSObject, URLSessionDataDelegate {
     private var buffer = ""
-    private let onChunk: (String) -> Void
-    private let onComplete: (Error?) -> Void
+    private var onChunk: ((String) -> Void)?
+    private var onComplete: ((Error?) -> Void)?
     weak var task: URLSessionDataTask?
 
-    init(onChunk: @escaping (String) -> Void, onComplete: @escaping (Error?) -> Void) {
+    func setCallbacks(onChunk: @escaping (String) -> Void, onComplete: @escaping (Error?) -> Void) {
         self.onChunk = onChunk
         self.onComplete = onComplete
+    }
+
+    private func clearCallbacks() {
+        onChunk = nil
+        onComplete = nil
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
@@ -342,7 +356,7 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
                 }
             }
             if !payload.isEmpty {
-                onChunk(payload)
+                onChunk?(payload)
             }
         }
     }
@@ -357,23 +371,32 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
                     payload += (payload.isEmpty ? "" : "\n") + String(s.dropFirst(6))
                 }
             }
-            if !payload.isEmpty { onChunk(payload) }
+            if !payload.isEmpty { onChunk?(payload) }
         }
-        session.finishTasksAndInvalidate()
-        onComplete(error)
+        onComplete?(error)
+        clearCallbacks()
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         guard let http = response as? HTTPURLResponse else {
             completionHandler(.cancel)
-            onComplete(URLError(.badServerResponse))
+            onComplete?(URLError(.badServerResponse))
+            clearCallbacks()
             return
         }
         guard http.statusCode == 200 else {
             completionHandler(.cancel)
-            onComplete(NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]))
+            onComplete?(NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]))
+            clearCallbacks()
             return
         }
         completionHandler(.allow)
+    }
+
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        DispatchQueue.main.async {
+            CompanionAPI.backgroundSessionCompletionHandler?()
+            CompanionAPI.backgroundSessionCompletionHandler = nil
+        }
     }
 }

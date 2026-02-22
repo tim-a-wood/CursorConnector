@@ -9,18 +9,26 @@ struct ContentView: View {
     @State private var isBuilding = false
     @State private var buildAlertMessage: String?
     @State private var showBuildAlert = false
+    /// When we have a project, periodically check /health. If unreachable (e.g. Mac slept), show banner and retry until back.
+    @State private var serverReachable: Bool = true
 
     private var portInt: Int { Int(port) ?? CompanionAPI.defaultPort }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                if selectedProject != nil, !serverReachable {
+                    reconnectingBanner
+                }
                 toolbarButtonRow(project: selectedProject)
                 if let project = selectedProject {
                     ChatView(project: project, host: host, port: portInt, messages: $messages)
                 } else {
                     emptyState
                 }
+            }
+            .task(id: "\(host):\(portInt):\(selectedProject?.path ?? "")") {
+                await connectionMonitorLoop()
             }
             .navigationTitle(selectedProject != nil ? (selectedProject!.label ?? (selectedProject!.path as NSString).lastPathComponent) : "Cursor")
             .navigationBarTitleDisplayMode(.inline)
@@ -78,6 +86,35 @@ struct ContentView: View {
         .padding(.horizontal)
         .padding(.vertical, 8)
         .foregroundStyle(.white)
+        .tint(.white)
+    }
+
+    private var reconnectingBanner: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .scaleEffect(0.9)
+            Text("Mac unreachable. Reconnecting…")
+                .font(.subheadline)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.9))
+        .foregroundStyle(.white)
+    }
+
+    /// Polls /health. When unreachable, sets serverReachable = false and retries every 5s until reachable again.
+    private func connectionMonitorLoop() async {
+        guard !host.isEmpty else { return }
+        let intervalReachable: UInt64 = 25_000_000_000   // 25s when connected
+        let intervalReconnecting: UInt64 = 5_000_000_000  // 5s when reconnecting
+        while !Task.isCancelled {
+            let ok = await CompanionAPI.health(host: host, port: portInt)
+            await MainActor.run {
+                serverReachable = ok
+            }
+            let interval = ok ? intervalReachable : intervalReconnecting
+            try? await Task.sleep(nanoseconds: interval)
+        }
     }
 
     private func triggerBuild() {

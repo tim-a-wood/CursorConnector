@@ -20,6 +20,7 @@
 		A1B10000000000000000000B /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B10000000000000000003B /* ChatView.swift */; };
 		A1B10000000000000000000C /* ConfigView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B10000000000000000003C /* ConfigView.swift */; };
 		A1B10000000000000000000D /* GitView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B10000000000000000003D /* GitView.swift */; };
+		A1B10000000000000000000E /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B10000000000000000003E /* AppDelegate.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -38,6 +39,7 @@
 		A1B10000000000000000003B /* ChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatView.swift; sourceTree = "<group>"; };
 		A1B10000000000000000003C /* ConfigView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigView.swift; sourceTree = "<group>"; };
 		A1B10000000000000000003D /* GitView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitView.swift; sourceTree = "<group>"; };
+		A1B10000000000000000003E /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -52,6 +54,7 @@
 		A1B100000000000000000031 /* CursorConnector */ = {
 			isa = PBXGroup;
 			children = (
+				A1B10000000000000000003E /* AppDelegate.swift */,
 				A1B100000000000000000011 /* CursorConnectorApp.swift */,
 				A1B100000000000000000012 /* ContentView.swift */,
 				A1B100000000000000000033 /* Models */,
@@ -157,6 +160,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A1B10000000000000000000E /* AppDelegate.swift in Sources */,
 				A1B100000000000000000001 /* CursorConnectorApp.swift in Sources */,
 				A1B100000000000000000002 /* ContentView.swift in Sources */,
 				A1B100000000000000000003 /* ProjectEntry.swift in Sources */,

@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Chat-style conversation with message bubbles and an input bar at the bottom.
 struct ChatView: View {
@@ -77,6 +78,15 @@ struct ChatView: View {
                     .focused($inputFocused)
 
                 Button {
+                    inputFocused.toggle()
+                } label: {
+                    Image(systemName: inputFocused ? "keyboard.chevron.compact.down" : "keyboard")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel(inputFocused ? "Hide keyboard" : "Show keyboard")
+
+                Button {
                     sendMessage()
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
@@ -104,6 +114,9 @@ struct ChatView: View {
         let assistantMsgId = UUID()
         messages.append(ChatMessage(id: assistantMsgId, role: .assistant, content: ""))
 
+        let backgroundTask = BackgroundTaskHolder()
+        backgroundTask.begin()
+
         CompanionAPI.sendPromptStream(
             path: project.path,
             prompt: text,
@@ -117,6 +130,7 @@ struct ChatView: View {
                 }
             },
             onComplete: { error in
+                backgroundTask.end()
                 Task { @MainActor in
                     if let idx = messages.firstIndex(where: { $0.id == assistantMsgId }) {
                         var content = messages[idx].content
@@ -133,6 +147,23 @@ struct ChatView: View {
                 }
             }
         )
+    }
+}
+
+/// Holds a UIApplication background task so the request can finish when the app is suspended.
+private final class BackgroundTaskHolder {
+    private var taskID: UIBackgroundTaskIdentifier = .invalid
+
+    func begin() {
+        taskID = UIApplication.shared.beginBackgroundTask(withName: "Cursor prompt stream") { [weak self] in
+            self?.end()
+        }
+    }
+
+    func end() {
+        guard taskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(taskID)
+        taskID = .invalid
     }
 }
 
