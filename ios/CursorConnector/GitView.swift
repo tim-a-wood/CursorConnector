@@ -19,8 +19,10 @@ struct GitView: View {
     @State private var actionsResponse: CompanionAPI.GitHubActionsResponse?
     @State private var actionsLoading = false
     @State private var actionsError: String?
+    @State private var actionsSectionExpanded = false
 
     private var hasChanges: Bool { status.map { !$0.changes.isEmpty } ?? false }
+    private var mostRecentRun: CompanionAPI.GitHubActionsRun? { actionsResponse?.runs.first }
 
     var body: some View {
         List {
@@ -49,67 +51,97 @@ struct GitView: View {
             }
 
             Section {
-                HStack {
-                    Text("CI workflow runs")
+                HStack(spacing: 8) {
+                    Text("GitHub Actions")
                         .font(.subheadline.weight(.medium))
                     Spacer()
-                    Button {
-                        Task { await loadGitHubActions() }
-                    } label: {
-                        Label("Refresh", systemImage: "arrow.clockwise")
-                            .font(.subheadline)
-                    }
-                    .disabled(actionsLoading)
-                }
-                if actionsLoading && actionsResponse == nil {
-                    HStack {
+                    if let run = mostRecentRun {
+                        Image(systemName: iconForActionsConclusion(run.conclusion, status: run.status))
+                            .foregroundStyle(colorForActionsConclusion(run.conclusion, status: run.status))
+                            .font(.caption)
+                    } else if actionsLoading {
                         ProgressView()
-                            .scaleEffect(0.9)
-                        Text("Loading…")
+                            .scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "circle.dashed")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                    }
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) { actionsSectionExpanded.toggle() }
+                    } label: {
+                        Image(systemName: actionsSectionExpanded ? "chevron.up.circle.fill" : "chevron.down.circle.fill")
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) { actionsSectionExpanded.toggle() }
+                }
+
+                if actionsSectionExpanded {
+                    HStack {
+                        Text("CI workflow runs")
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                        Button {
+                            Task { await loadGitHubActions() }
+                        } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                                .font(.subheadline)
+                        }
+                        .disabled(actionsLoading)
+                    }
+                    if actionsLoading && actionsResponse == nil {
+                        HStack {
+                            ProgressView()
+                                .scaleEffect(0.9)
+                            Text("Loading…")
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        }
+                    }
+                    if let err = actionsError ?? actionsResponse?.error, !err.isEmpty {
+                        Text(err)
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                    }
+                    if let runs = actionsResponse?.runs, !runs.isEmpty {
+                        ForEach(runs) { run in
+                            Button {
+                                if let url = URL(string: run.htmlUrl) {
+                                    UIApplication.shared.open(url)
+                                }
+                            } label: {
+                                HStack(alignment: .center, spacing: 10) {
+                                    Image(systemName: iconForActionsConclusion(run.conclusion, status: run.status))
+                                        .foregroundStyle(colorForActionsConclusion(run.conclusion, status: run.status))
+                                        .font(.body)
+                                        .frame(width: 24, alignment: .center)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(run.name)
+                                            .font(.subheadline.weight(.medium))
+                                            .foregroundStyle(.primary)
+                                        Text("\(run.headBranch) · \(relativeTime(run.createdAt))")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    Image(systemName: "arrow.up.right.square")
+                                        .font(.caption)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    } else if actionsResponse != nil && actionsError == nil && (actionsResponse?.error?.isEmpty ?? true) {
+                        Text("No workflow runs")
                             .foregroundStyle(.secondary)
                             .font(.caption)
                     }
                 }
-                if let err = actionsError ?? actionsResponse?.error, !err.isEmpty {
-                    Text(err)
-                        .foregroundStyle(.red)
-                        .font(.caption)
-                }
-                if let runs = actionsResponse?.runs, !runs.isEmpty {
-                    ForEach(runs) { run in
-                        Button {
-                            if let url = URL(string: run.htmlUrl) {
-                                UIApplication.shared.open(url)
-                            }
-                        } label: {
-                            HStack(alignment: .center, spacing: 10) {
-                                Image(systemName: iconForActionsConclusion(run.conclusion, status: run.status))
-                                    .foregroundStyle(colorForActionsConclusion(run.conclusion, status: run.status))
-                                    .font(.body)
-                                    .frame(width: 24, alignment: .center)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(run.name)
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundStyle(.primary)
-                                    Text("\(run.headBranch) · \(relativeTime(run.createdAt))")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                Image(systemName: "arrow.up.right.square")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
-                } else if actionsResponse != nil && actionsError == nil && (actionsResponse?.error?.isEmpty ?? true) {
-                    Text("No workflow runs")
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
-                }
-            } header: {
-                Text("GitHub Actions")
             }
 
             Section {
