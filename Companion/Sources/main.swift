@@ -189,6 +189,78 @@ func runAgentPrompt(path: String, prompt: String) -> (output: String, exitCode: 
     return (combined, process.terminationStatus)
 }
 
+/// Runs the agent and streams output via `writeChunk` (SSE-formatted data). Blocks until process exits or timeout. Returns exit code.
+func runAgentPromptStreamSync(path: String, prompt: String, writeChunk: (Data) throws -> Void) -> Int32 {
+    guard !path.isEmpty, path.hasPrefix("/") else { return -1 }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return -1 }
+    guard !prompt.isEmpty else { return -1 }
+
+    patchCLIConfigToAuto()
+
+    let process = Process()
+    if let agentPath = agentExecutablePath {
+        process.executableURL = URL(fileURLWithPath: agentPath)
+        process.arguments = ["--model", "auto", "-p", "--force", "--trust", prompt]
+    } else {
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["agent", "--model", "auto", "-p", "--force", "--trust", prompt]
+    }
+    process.currentDirectoryURL = URL(fileURLWithPath: path)
+    process.environment = agentEnvironment()
+
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+
+    do {
+        try process.run()
+    } catch {
+        try? writeChunk(sseData("Error: \(error.localizedDescription)"))
+        return -1
+    }
+
+    let outHandle = outPipe.fileHandleForReading
+    var totalBytes = 0
+    let deadline = Date().addingTimeInterval(agentTimeoutSeconds)
+
+    while Date() < deadline {
+        let d = outHandle.availableData
+        if d.isEmpty { break }
+        totalBytes += d.count
+        if totalBytes > agentMaxOutputBytes { break }
+        if let s = String(data: d, encoding: .utf8) {
+            try? writeChunk(sseData(s))
+        }
+    }
+
+    if Date() >= deadline {
+        process.terminate()
+        process.waitUntilExit()
+        try? writeChunk(sseData("Error: Agent timed out after \(Int(agentTimeoutSeconds)) seconds."))
+        return -1
+    }
+
+    process.waitUntilExit()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    if !errData.isEmpty, let errStr = String(data: errData.prefix(agentMaxOutputBytes), encoding: .utf8) {
+        try? writeChunk(sseData("\n--- stderr ---\n" + errStr))
+    }
+    try? writeChunk(sseData("\n[exit: \(process.terminationStatus)]"))
+    return process.terminationStatus
+}
+
+private func sseData(_ text: String) -> Data {
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+    var out = ""
+    for line in lines {
+        out += "data: " + line + "\n"
+    }
+    out += "\n"
+    return Data(out.utf8)
+}
+
 // MARK: - File tree and content (Phase 3)
 
 struct FileTreeEntry: Codable {
@@ -265,6 +337,117 @@ func writeFileContent(path: String, content: String) -> Bool {
     } catch {
         return false
     }
+}
+
+// MARK: - Git (run in project directory on Mac)
+
+func isGitRepo(path: String) -> Bool {
+    var isDir: ObjCBool = false
+    let gitPath = (path as NSString).appendingPathComponent(".git")
+    return FileManager.default.fileExists(atPath: gitPath, isDirectory: &isDir) && isDir.boolValue
+}
+
+/// Run a git command in the given directory. Returns (stdout, stderr, exitCode).
+func runGit(in path: String, arguments: [String]) -> (stdout: String, stderr: String, exitCode: Int32) {
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+        return ("", "Not a directory", -1)
+    }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = arguments
+    process.currentDirectoryURL = URL(fileURLWithPath: path)
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let outStr = String(data: outData, encoding: .utf8) ?? ""
+        let errStr = String(data: errData, encoding: .utf8) ?? ""
+        return (outStr, errStr, process.terminationStatus)
+    } catch {
+        return ("", error.localizedDescription, -1)
+    }
+}
+
+struct GitChangeEntry: Codable {
+    var status: String  // two-letter porcelain code, e.g. " M", "M ", "??"
+    var path: String
+}
+
+struct GitStatusResponse: Codable {
+    var branch: String
+    var changes: [GitChangeEntry]
+    var hasChanges: Bool { !changes.isEmpty }
+}
+
+func getGitStatus(path: String) -> GitStatusResponse? {
+    guard isGitRepo(path: path) else { return nil }
+    let (branchOut, _, branchCode) = runGit(in: path, arguments: ["rev-parse", "--abbrev-ref", "HEAD"])
+    var branch = branchCode == 0 ? branchOut.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+    if branch.isEmpty { branch = "HEAD" }
+    let (statusOut, _, statusCode) = runGit(in: path, arguments: ["status", "--porcelain", "-z"])
+    var changes: [GitChangeEntry] = []
+    if statusCode == 0, !statusOut.isEmpty {
+        let parts = statusOut.split(separator: "\0", omittingEmptySubsequences: false)
+        for part in parts {
+            let line = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.count >= 4 else { continue }
+            let status = String(line.prefix(2)).trimmingCharacters(in: .whitespaces)
+            let filePath = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            if !filePath.isEmpty {
+                changes.append(GitChangeEntry(status: status.isEmpty ? "??" : status, path: filePath))
+            }
+        }
+    }
+    return GitStatusResponse(branch: branch, changes: changes)
+}
+
+struct GitGenerateMessageResponse: Codable {
+    var message: String
+}
+
+func generateGitCommitMessage(path: String) -> String? {
+    guard isGitRepo(path: path) else { return nil }
+    let (statusOut, _, _) = runGit(in: path, arguments: ["status", "--short"])
+    let (diffOut, _, _) = runGit(in: path, arguments: ["diff", "--stat"])
+    let (diffStagedOut, _, _) = runGit(in: path, arguments: ["diff", "--cached", "--stat"])
+    let context = """
+    Git status:
+    \(statusOut)
+    Staged diff stat:
+    \(diffStagedOut)
+    Unstaged diff stat:
+    \(diffOut)
+    """
+    let prompt = "Generate a single-line git commit message for these changes. Reply with only the message, no quotes or explanation."
+    guard let result = runAgentPrompt(path: path, prompt: prompt + "\n\n" + context) else { return nil }
+    let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    let firstLine = trimmed.split(separator: "\n").first.map(String.init) ?? trimmed
+    return firstLine.isEmpty ? nil : String(firstLine.prefix(500))
+}
+
+func gitCommit(path: String, message: String) -> (success: Bool, output: String, error: String) {
+    guard isGitRepo(path: path), !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return (false, "", "Not a git repo or empty message")
+    }
+    let (_, _, addCode) = runGit(in: path, arguments: ["add", "-A"])
+    guard addCode == 0 else {
+        let (_, err, _) = runGit(in: path, arguments: ["add", "-A"])
+        return (false, "", err)
+    }
+    let (out, err, code) = runGit(in: path, arguments: ["commit", "-m", message])
+    return (code == 0, out, err)
+}
+
+func gitPush(path: String) -> (success: Bool, output: String, error: String) {
+    guard isGitRepo(path: path) else { return (false, "", "Not a git repo") }
+    let (out, err, code) = runGit(in: path, arguments: ["push"])
+    return (code == 0, out, err)
 }
 
 // MARK: - Server
@@ -364,6 +547,272 @@ server.POST["/prompt"] = { request in
     return .ok(.data(data, contentType: "application/json"))
 }
 
+server.POST["/prompt-stream"] = { request in
+    let body = request.body
+    guard !body.isEmpty,
+          let decoded = try? JSONDecoder().decode(PromptRequest.self, from: Data(body)) else {
+        return .badRequest(.text("Missing or invalid JSON body with 'path' and 'prompt'"))
+    }
+    let path = decoded.path
+    let prompt = decoded.prompt
+    let headers: [String: String] = [
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    ]
+    return .raw(200, "OK", headers) { writer in
+        if prompt.isEmpty || path.isEmpty {
+            try writer.write(sseData("Error: Invalid path or empty prompt"))
+            return
+        }
+        let exitCode = runAgentPromptStreamSync(path: path, prompt: prompt) { chunk in
+            try writer.write(chunk)
+        }
+        if exitCode == 127 {
+            try? writer.write(sseData("The 'agent' command was not found (exit code 127). Install the Cursor Agent CLI on your Mac:\n\n  curl https://cursor.com/install -fsSL | bash\n\nThen restart the Companion and try again."))
+        }
+    }
+}
+
+// MARK: - Git endpoints
+
+server.GET["/git/status"] = { request in
+    guard let pathParam = request.queryParams.first(where: { $0.0 == "path" })?.1,
+          let path = pathParam.removingPercentEncoding,
+          !path.isEmpty, path.hasPrefix("/"), !path.contains("..") else {
+        return .badRequest(.text("Missing or invalid 'path' query parameter"))
+    }
+    guard let status = getGitStatus(path: path) else {
+        return .badRequest(.text("Not a git repository"))
+    }
+    guard let data = try? JSONEncoder().encode(status) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
+struct GitPathRequest: Codable { var path: String }
+
+server.POST["/git/generate-message"] = { request in
+    let body = request.body
+    guard !body.isEmpty,
+          let decoded = try? JSONDecoder().decode(GitPathRequest.self, from: Data(body)) else {
+        return .badRequest(.text("Missing or invalid JSON body with 'path'"))
+    }
+    guard let message = generateGitCommitMessage(path: decoded.path) else {
+        return .badRequest(.text("Not a git repo or could not generate message"))
+    }
+    let response = GitGenerateMessageResponse(message: message)
+    guard let data = try? JSONEncoder().encode(response) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
+struct GitCommitRequest: Codable {
+    var path: String
+    var message: String
+}
+
+server.POST["/git/commit"] = { request in
+    let body = request.body
+    guard !body.isEmpty,
+          let decoded = try? JSONDecoder().decode(GitCommitRequest.self, from: Data(body)) else {
+        return .badRequest(.text("Missing or invalid JSON body with 'path' and 'message'"))
+    }
+    let result = gitCommit(path: decoded.path, message: decoded.message)
+    let bodyDict: [String: Any] = ["success": result.success, "output": result.output, "error": result.error]
+    guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
+server.POST["/git/push"] = { request in
+    let body = request.body
+    guard !body.isEmpty,
+          let decoded = try? JSONDecoder().decode(GitPathRequest.self, from: Data(body)) else {
+        return .badRequest(.text("Missing or invalid JSON body with 'path'"))
+    }
+    let result = gitPush(path: decoded.path)
+    let bodyDict: [String: Any] = ["success": result.success, "output": result.output, "error": result.error]
+    guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
+// MARK: - Xcode build and install to device
+
+let xcodeBuildTimeoutSeconds: TimeInterval = 300
+let xcodeSchemeName = "CursorConnector"
+let xcodeProjectName = "CursorConnector.xcodeproj"
+let xcodeProductName = "CursorConnector.app"
+
+/// Resolve path to the iOS Xcode project. Uses optional repoPath from request, else current directory + "/ios".
+func resolveIOSProjectPath(repoPath: String?) -> String? {
+    let base: String
+    if let r = repoPath?.trimmingCharacters(in: .whitespacesAndNewlines), !r.isEmpty {
+        base = (r as NSString).standardizingPath
+    } else {
+        base = FileManager.default.currentDirectoryPath
+    }
+    let iosDir = (base as NSString).appendingPathComponent("ios")
+    let projectPath = (iosDir as NSString).appendingPathComponent(xcodeProjectName)
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: projectPath, isDirectory: &isDir), isDir.boolValue else {
+        return nil
+    }
+    return iosDir
+}
+
+/// Run xcodebuild -showdestinations and return the first connected iOS device id.
+func getFirstConnectedDeviceID(projectPath: String) -> String? {
+    let projectFile = (projectPath as NSString).appendingPathComponent(xcodeProjectName)
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    process.arguments = ["xcodebuild", "-project", projectFile, "-scheme", xcodeSchemeName, "-showdestinations"]
+    process.currentDirectoryURL = URL(fileURLWithPath: projectPath)
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let out = String(data: data, encoding: .utf8) else { return nil }
+        var currentId: String?
+        var currentType: String?
+        var isDevice = false
+        for line in out.split(separator: "\n") {
+            let s = line.trimmingCharacters(in: .whitespaces)
+            if s.hasPrefix("id = ") {
+                currentId = String(s.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            } else if s.hasPrefix("destinationType = ") {
+                currentType = String(s.dropFirst(17)).trimmingCharacters(in: .whitespaces)
+                isDevice = (currentType == "device")
+            } else if s.hasPrefix("platform = ") {
+                let platform = String(s.dropFirst(10)).trimmingCharacters(in: .whitespaces)
+                if isDevice, platform == "iOS", let id = currentId, !id.isEmpty {
+                    return id
+                }
+                currentId = nil
+                currentType = nil
+                isDevice = false
+            }
+        }
+        return nil
+    } catch {
+        return nil
+    }
+}
+
+/// Build the app and install to the given device. Returns (combinedOutput, exitCode). exitCode 0 = success.
+func runXcodeBuildAndInstall(projectPath: String, deviceId: String) -> (output: String, exitCode: Int32) {
+    let projectFile = (projectPath as NSString).appendingPathComponent(xcodeProjectName)
+    let derivedDataPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("CursorConnector-Build-\(UUID().uuidString.prefix(8))")
+    defer { try? FileManager.default.removeItem(atPath: derivedDataPath) }
+
+    let buildProcess = Process()
+    buildProcess.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    buildProcess.arguments = [
+        "xcodebuild",
+        "-project", projectFile,
+        "-scheme", xcodeSchemeName,
+        "-destination", "id=\(deviceId)",
+        "-configuration", "Debug",
+        "-derivedDataPath", derivedDataPath,
+        "-allowProvisioningUpdates",
+        "build"
+    ]
+    buildProcess.currentDirectoryURL = URL(fileURLWithPath: projectPath)
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    buildProcess.standardOutput = outPipe
+    buildProcess.standardError = errPipe
+    do {
+        try buildProcess.run()
+    } catch {
+        return ("Error: \(error.localizedDescription)", -1)
+    }
+    let group = DispatchGroup()
+    group.enter()
+    DispatchQueue.global(qos: .userInitiated).async {
+        buildProcess.waitUntilExit()
+        group.leave()
+    }
+    if group.wait(timeout: .now() + xcodeBuildTimeoutSeconds) == .timedOut {
+        buildProcess.terminate()
+        buildProcess.waitUntilExit()
+        return ("Error: Build timed out after \(Int(xcodeBuildTimeoutSeconds)) seconds.", -1)
+    }
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    let outStr = String(data: outData, encoding: .utf8) ?? ""
+    let errStr = String(data: errData, encoding: .utf8) ?? ""
+    let buildOutput = errStr.isEmpty ? outStr : "\(outStr)\n\(errStr)"
+    guard buildProcess.terminationStatus == 0 else {
+        return (buildOutput, buildProcess.terminationStatus)
+    }
+
+    let appPath = (derivedDataPath as NSString).appendingPathComponent("Build/Products/Debug-iphoneos/\(xcodeProductName)")
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: appPath, isDirectory: &isDir), isDir.boolValue else {
+        return (buildOutput + "\nError: Built app not found at \(appPath)", -1)
+    }
+
+    let installProcess = Process()
+    installProcess.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    installProcess.arguments = ["devicectl", "device", "install", "app", "--device", deviceId, appPath]
+    installProcess.currentDirectoryURL = URL(fileURLWithPath: projectPath)
+    let installOut = Pipe()
+    let installErr = Pipe()
+    installProcess.standardOutput = installOut
+    installProcess.standardError = installErr
+    do {
+        try installProcess.run()
+        installProcess.waitUntilExit()
+    } catch {
+        return (buildOutput + "\nInstall error: \(error.localizedDescription)", -1)
+    }
+    let installOutStr = String(data: installOut.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let installErrStr = String(data: installErr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let installLog = installErrStr.isEmpty ? installOutStr : "\(installOutStr)\n\(installErrStr)"
+    if installProcess.terminationStatus != 0 {
+        return (buildOutput + "\n--- Install failed ---\n" + installLog, installProcess.terminationStatus)
+    }
+    return (buildOutput + "\n--- Installed on device ---\n" + installLog, 0)
+}
+
+struct XcodeBuildRequest: Codable {
+    var repoPath: String?
+}
+
+struct XcodeBuildResponse: Codable {
+    var success: Bool
+    var output: String
+    var error: String
+}
+
+server.POST["/xcode/build"] = { request in
+    var repoPath: String?
+    if !request.body.isEmpty,
+       let decoded = try? JSONDecoder().decode(XcodeBuildRequest.self, from: Data(request.body)) {
+        repoPath = decoded.repoPath
+    }
+    guard let projectPath = resolveIOSProjectPath(repoPath: repoPath) else {
+        let bodyDict: [String: Any] = ["success": false, "output": "", "error": "iOS project not found. Run Companion from the CursorConnector repo root, or send repoPath in the request body."]
+        guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+        return .ok(.data(data, contentType: "application/json"))
+    }
+    guard let deviceId = getFirstConnectedDeviceID(projectPath: projectPath) else {
+        let bodyDict: [String: Any] = ["success": false, "output": "", "error": "No connected iOS device found. Connect your iPhone and ensure it is trusted."]
+        guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+        return .ok(.data(data, contentType: "application/json"))
+    }
+    let (output, exitCode) = runXcodeBuildAndInstall(projectPath: projectPath, deviceId: deviceId)
+    let bodyDict: [String: Any] = [
+        "success": exitCode == 0,
+        "output": output,
+        "error": exitCode == 0 ? "" : (output.split(separator: "\n").last.map(String.init) ?? "Build or install failed")
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
 do {
     try server.start(port)
     print("CursorConnector Companion running on http://localhost:\(port)")
@@ -374,7 +823,13 @@ do {
     print("  POST /files/content - write file (body: {\"path\": \"...\", \"content\": \"...\"})")
     print("  POST /projects/open - open project (body: {\"path\": \"/absolute/path\"})")
     print("  POST /prompt        - run agent (body: {\"path\": \"/project/path\", \"prompt\": \"...\"})")
-    print("  POST /restart        - exit process (use with a restarter script to restart)")
+    print("  POST /prompt-stream - run agent with SSE streaming output")
+    print("  GET  /git/status    - git status (query: path=...)")
+    print("  POST /git/generate-message - generate commit message (body: {\"path\": \"...\"})")
+    print("  POST /git/commit    - git add -A && commit (body: {\"path\": \"...\", \"message\": \"...\"})")
+    print("  POST /git/push     - git push (body: {\"path\": \"...\"})")
+    print("  POST /xcode/build  - build iOS app and install to connected device (body: optional {\"repoPath\": \"/path\"})")
+    print("  POST /restart       - exit process (use with a restarter script to restart)")
     RunLoop.main.run()
 } catch {
     print("Failed to start server: \(error)")

@@ -6,6 +6,9 @@ struct ContentView: View {
     @State private var selectedProject: ProjectEntry?
     @State private var messages: [ChatMessage] = []
     @State private var showConfig = false
+    @State private var isBuilding = false
+    @State private var buildAlertMessage: String?
+    @State private var showBuildAlert = false
 
     private var portInt: Int { Int(port) ?? CompanionAPI.defaultPort }
 
@@ -21,6 +24,26 @@ struct ContentView: View {
                                 } label: {
                                     Label("Files", systemImage: "folder")
                                 }
+                            }
+                            ToolbarItem(placement: .topBarLeading) {
+                                NavigationLink {
+                                    GitView(projectPath: project.path, host: host, port: portInt)
+                                } label: {
+                                    Label("Git", systemImage: "vault")
+                                }
+                            }
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button {
+                                    triggerBuild()
+                                } label: {
+                                    if isBuilding {
+                                        ProgressView()
+                                            .scaleEffect(0.8)
+                                    } else {
+                                        Label("Build", systemImage: "hammer")
+                                    }
+                                }
+                                .disabled(isBuilding || host.isEmpty)
                             }
                             ToolbarItem(placement: .topBarTrailing) {
                                 Button {
@@ -40,6 +63,19 @@ struct ContentView: View {
                 if selectedProject == nil {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {
+                            triggerBuild()
+                        } label: {
+                            if isBuilding {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                            } else {
+                                Label("Build", systemImage: "hammer")
+                            }
+                        }
+                        .disabled(isBuilding || host.isEmpty)
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
                             showConfig = true
                         } label: {
                             Label("Settings", systemImage: "gearshape")
@@ -54,6 +90,39 @@ struct ContentView: View {
                             messages = []
                         }
                     }
+            }
+            .alert("Build", isPresented: $showBuildAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                if let msg = buildAlertMessage {
+                    Text(msg)
+                }
+            }
+        }
+    }
+
+    private func triggerBuild() {
+        guard !host.isEmpty, !isBuilding else { return }
+        isBuilding = true
+        Task {
+            do {
+                let result = try await CompanionAPI.buildXcode(host: host, port: portInt)
+                await MainActor.run {
+                    isBuilding = false
+                    if result.success {
+                        buildAlertMessage = "Built and installed on your device."
+                    } else {
+                        buildAlertMessage = (result.error.isEmpty ? "Build or install failed." : result.error)
+                            + (result.output.isEmpty ? "" : "\n\n\(String(result.output.suffix(2000)))")
+                    }
+                    showBuildAlert = true
+                }
+            } catch {
+                await MainActor.run {
+                    isBuilding = false
+                    buildAlertMessage = error.localizedDescription
+                    showBuildAlert = true
+                }
             }
         }
     }

@@ -34,7 +34,7 @@ struct ChatView: View {
                         ChatBubbleView(message: msg)
                             .id(msg.id)
                     }
-                    if sending {
+                    if sending, messages.last?.role == .assistant, messages.last?.content.isEmpty == true {
                         HStack {
                             ProgressView()
                                 .scaleEffect(0.9)
@@ -101,25 +101,38 @@ struct ChatView: View {
         messages.append(userMsg)
 
         sending = true
-        Task {
-            do {
-                let response = try await CompanionAPI.sendPrompt(path: project.path, prompt: text, host: host, port: port)
-                await MainActor.run {
-                    var output = response.output
-                    if response.exitCode != 0 {
-                        output = "*(Exit code \(response.exitCode))*\n\n" + output
+        let assistantMsgId = UUID()
+        messages.append(ChatMessage(id: assistantMsgId, role: .assistant, content: ""))
+
+        CompanionAPI.sendPromptStream(
+            path: project.path,
+            prompt: text,
+            host: host,
+            port: port,
+            onChunk: { chunk in
+                Task { @MainActor in
+                    if let idx = messages.firstIndex(where: { $0.id == assistantMsgId }) {
+                        messages[idx].content += chunk
                     }
-                    messages.append(ChatMessage(role: .assistant, content: output))
-                    sending = false
                 }
-            } catch {
-                await MainActor.run {
-                    sendError = error.localizedDescription
-                    messages.append(ChatMessage(role: .assistant, content: "Error: \(error.localizedDescription)"))
+            },
+            onComplete: { error in
+                Task { @MainActor in
+                    if let idx = messages.firstIndex(where: { $0.id == assistantMsgId }) {
+                        var content = messages[idx].content
+                        if let r = content.range(of: "\n[exit: ") {
+                            content = String(content[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        messages[idx].content = content
+                        if let err = error {
+                            messages[idx].content += "\n\nError: \(err.localizedDescription)"
+                            sendError = err.localizedDescription
+                        }
+                    }
                     sending = false
                 }
             }
-        }
+        )
     }
 }
 
