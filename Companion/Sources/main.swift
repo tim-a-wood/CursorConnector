@@ -1204,6 +1204,47 @@ struct XcodeBuildResponse: Codable {
 let testflightCredentialsPath = (FileManager.default.homeDirectoryForCurrentUser.path as NSString).appendingPathComponent(".cursor-connector-testflight")
 let testflightBuildTimeoutSeconds: TimeInterval = 600
 
+/// Path to the iOS app's Info.plist (projectPath is the ios/ directory).
+private func infoPlistPath(projectPath: String) -> String {
+    (projectPath as NSString).appendingPathComponent("CursorConnector/Info.plist")
+}
+
+private func pbxprojPath(projectPath: String) -> String {
+    (projectPath as NSString).appendingPathComponent("\(xcodeProjectName)/project.pbxproj")
+}
+
+/// Increment build number in both project.pbxproj (CURRENT_PROJECT_VERSION) and Info.plist (CFBundleVersion). Xcode uses the project setting for the built app. Returns new build number or nil on failure.
+func incrementBuildNumber(projectPath: String) -> String? {
+    let pbxPath = pbxprojPath(projectPath: projectPath)
+    guard FileManager.default.fileExists(atPath: pbxPath),
+          var content = try? String(contentsOfFile: pbxPath, encoding: .utf8) else { return nil }
+    // Find current CURRENT_PROJECT_VERSION value (e.g. "CURRENT_PROJECT_VERSION = 1;")
+    let pattern = "CURRENT_PROJECT_VERSION = ([0-9]+);"
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let firstMatch = regex.firstMatch(in: content, range: NSRange(content.startIndex..., in: content)),
+          let range = Range(firstMatch.range(at: 1), in: content),
+          let num = Int(content[range]) else { return nil }
+    let next = num + 1
+    let nextStr = "\(next)"
+    content = regex.stringByReplacingMatches(in: content, range: NSRange(content.startIndex..., in: content), withTemplate: "CURRENT_PROJECT_VERSION = \(nextStr);")
+    do {
+        try content.write(toFile: pbxPath, atomically: true, encoding: .utf8)
+    } catch {
+        return nil
+    }
+    // Keep Info.plist in sync
+    let plistPath = infoPlistPath(projectPath: projectPath)
+    if FileManager.default.fileExists(atPath: plistPath),
+       let data = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
+       var plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] {
+        plist["CFBundleVersion"] = nextStr
+        if let outData = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            try? outData.write(to: URL(fileURLWithPath: plistPath))
+        }
+    }
+    return nextStr
+}
+
 /// Read Apple ID and app-specific password from ~/.cursor-connector-testflight (line 1: Apple ID, line 2: app-specific password, optional line 3: team ID).
 func readTestFlightCredentials() -> (appleId: String, appSpecificPassword: String, teamID: String?)? {
     guard let content = try? String(contentsOfFile: testflightCredentialsPath, encoding: .utf8) else { return nil }
@@ -1257,7 +1298,7 @@ func runXcodeArchive(projectPath: String) -> (archivePath: String?, output: Stri
 func runExportArchive(archivePath: String, exportDir: String, teamID: String?) -> (ipaPath: String?, output: String, exitCode: Int32) {
     let plistPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("ExportOptions-\(UUID().uuidString.prefix(8)).plist")
     defer { try? FileManager.default.removeItem(atPath: plistPath) }
-    var plistDict: [String: Any] = ["method": "app-store"]
+    var plistDict: [String: Any] = ["method": "app-store-connect", "signingStyle": "automatic"]
     if let tid = teamID, !tid.isEmpty {
         plistDict["teamID"] = tid
     }
@@ -1295,7 +1336,7 @@ func runExportArchive(archivePath: String, exportDir: String, teamID: String?) -
     return (ipaPath, combined, 0)
 }
 
-/// Upload .ipa to App Store Connect via altool. Returns (output, exitCode).
+/// Upload .ipa to App Store Connect via altool. Streams output to the terminal so the user sees progress (upload can take 5–15+ min). Returns (output, exitCode).
 func runAltoolUpload(ipaPath: String, appleId: String, appSpecificPassword: String) -> (output: String, exitCode: Int32) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
@@ -1304,21 +1345,70 @@ func runAltoolUpload(ipaPath: String, appleId: String, appSpecificPassword: Stri
         "-f", ipaPath,
         "-t", "ios",
         "-u", appleId,
-        "-p", appSpecificPassword
+        "-p", appSpecificPassword,
+        "--verbose"
     ]
     let outPipe = Pipe()
     let errPipe = Pipe()
     process.standardOutput = outPipe
     process.standardError = errPipe
+
+    let outputLock = NSLock()
+    var combinedOutput = ""
+
+    func readAndPrint(_ fileHandle: FileHandle) {
+        let data = fileHandle.readDataToEndOfFile()
+        if let str = String(data: data, encoding: .utf8), !str.isEmpty {
+            outputLock.lock()
+            combinedOutput += str
+            outputLock.unlock()
+            for line in str.split(separator: "\n", omittingEmptySubsequences: false) {
+                print("  [altool] \(line)")
+            }
+        }
+    }
+
+    outPipe.fileHandleForReading.readabilityHandler = { h in
+        let data = h.availableData
+        guard !data.isEmpty else { return }
+        if let str = String(data: data, encoding: .utf8) {
+            outputLock.lock()
+            combinedOutput += str
+            outputLock.unlock()
+            for line in str.split(separator: "\n", omittingEmptySubsequences: false) {
+                print("  [altool] \(line)")
+            }
+        }
+    }
+    errPipe.fileHandleForReading.readabilityHandler = { h in
+        let data = h.availableData
+        guard !data.isEmpty else { return }
+        if let str = String(data: data, encoding: .utf8) {
+            outputLock.lock()
+            combinedOutput += str
+            outputLock.unlock()
+            for line in str.split(separator: "\n", omittingEmptySubsequences: false) {
+                print("  [altool] \(line)")
+            }
+        }
+    }
+
     do {
         try process.run()
     } catch {
         return ("Error: \(error.localizedDescription)", -1)
     }
     process.waitUntilExit()
-    let outStr = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    return (errStr.isEmpty ? outStr : "\(outStr)\n\(errStr)", process.terminationStatus)
+
+    outPipe.fileHandleForReading.readabilityHandler = nil
+    errPipe.fileHandleForReading.readabilityHandler = nil
+    readAndPrint(outPipe.fileHandleForReading)
+    readAndPrint(errPipe.fileHandleForReading)
+
+    outputLock.lock()
+    let result = combinedOutput
+    outputLock.unlock()
+    return (result, process.terminationStatus)
 }
 
 // If the client disconnects before the build finishes (e.g. timeout), Swifter may log "Failed to send response: writeFailed(\"Broken pipe\")". The build can still have succeeded.
@@ -1373,6 +1463,12 @@ server.POST["/xcode-build-testflight"] = { request in
         return .ok(.data(data, contentType: "application/json"))
     }
     print("[xcode-build-testflight] Project: \(projectPath)")
+    let newBuild = incrementBuildNumber(projectPath: projectPath)
+    if let newBuild = newBuild {
+        print("[xcode-build-testflight] Bumped build number to \(newBuild)")
+    } else {
+        print("[xcode-build-testflight] Warning: could not bump build number in project")
+    }
     var fullOutput = ""
 
     print("[xcode-build-testflight] Archiving...")
@@ -1393,28 +1489,57 @@ server.POST["/xcode-build-testflight"] = { request in
     }
 
     print("[xcode-build-testflight] Exporting IPA...")
-    let (ipaPathOpt, exportOutput, exportCode) = runExportArchive(archivePath: archivePath, exportDir: exportDir, teamID: creds.teamID)
+    var (ipaPathOpt, exportOutput, exportCode) = runExportArchive(archivePath: archivePath, exportDir: exportDir, teamID: creds.teamID)
     fullOutput += "\n" + exportOutput
+    if ipaPathOpt == nil, exportCode != 0, exportOutput.contains("No profiles for"), creds.teamID != nil {
+        print("[xcode-build-testflight] Retrying export without Team ID (in case line 3 of credentials is wrong)...")
+        let (retryPath, retryOutput, retryCode) = runExportArchive(archivePath: archivePath, exportDir: exportDir, teamID: nil)
+        fullOutput += "\n[retry without teamID]\n" + retryOutput
+        if retryPath != nil, retryCode == 0 {
+            ipaPathOpt = retryPath
+            exportCode = 0
+        }
+    }
     guard let ipaPath = ipaPathOpt, exportCode == 0 else {
-        let bodyDict: [String: Any] = ["success": false, "output": fullOutput, "error": "Export failed. Ensure your Team ID is correct (line 3 of credentials file) and the app is set up for App Store distribution in Xcode."]
+        print("[xcode-build-testflight] Export failed (exit code \(exportCode)). xcodebuild output:")
+        print(exportOutput)
+        let errorMessage: String
+        if exportOutput.contains("No profiles for") {
+            errorMessage = "No App Store provisioning profile. Do all of: (1) App Store Connect → create an app with bundle ID com.cursorconnector.app. (2) Xcode → open ios/CursorConnector.xcodeproj → CursorConnector target → Signing & Capabilities → set Team, turn on Automatically manage signing. (3) Xcode → Product → Archive and wait for it to finish. (4) If it still fails, remove line 3 (Team ID) from ~/.cursor-connector-testflight and try again."
+        } else if exportOutput.contains("doesn't include signing certificate") {
+            errorMessage = "Provisioning profile and distribution certificate are out of sync. In Xcode: open the project → Signing & Capabilities → turn Off \"Automatically manage signing\", then turn it back On (same Team). Then Product → Archive once. That refreshes the profile to match your certificate. Try TestFlight again after that."
+        } else if exportOutput.contains("No signing certificate") || exportOutput.contains("iOS Distribution") {
+            errorMessage = "No iOS Distribution certificate found. In Xcode: Xcode → Settings → Accounts → [your Apple ID] → Manage Certificates. Click + → Apple Distribution (or iOS Distribution). If one exists but export still fails, run the Companion from a Terminal window where you’re logged in (so the keychain is unlocked), then try TestFlight again."
+        } else {
+            errorMessage = "Export failed. Ensure your Team ID is correct (line 3 of credentials file) and the app is set up for App Store distribution in Xcode."
+        }
+        let bodyDict: [String: Any] = ["success": false, "output": fullOutput, "error": errorMessage]
         guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
         return .ok(.data(data, contentType: "application/json"))
     }
 
-    print("[xcode-build-testflight] Uploading to App Store Connect...")
+    print("[xcode-build-testflight] Uploading to App Store Connect... (can take 5–15 min, output below)")
     let (uploadOutput, uploadCode) = runAltoolUpload(ipaPath: ipaPath, appleId: creds.appleId, appSpecificPassword: creds.appSpecificPassword)
     fullOutput += "\n" + uploadOutput
     if uploadCode != 0 {
-        let bodyDict: [String: Any] = ["success": false, "output": fullOutput, "error": "Upload failed. Check Apple ID and app-specific password in ~/.cursor-connector-testflight."]
+        print("[xcode-build-testflight] Upload failed (exit code \(uploadCode)). altool output:")
+        print(uploadOutput)
+        let hint = "Upload failed. The Companion reads credentials from ~/.cursor-connector-testflight (your home directory), not from the project folder. Check Apple ID (line 1) and app-specific password (line 2); regenerate the password at appleid.apple.com if needed."
+        let errDetail = uploadOutput.split(separator: "\n").last.map(String.init).map { " Apple said: \($0)" } ?? ""
+        let bodyDict: [String: Any] = ["success": false, "output": fullOutput, "error": hint + errDetail, "buildNumber": newBuild ?? ""]
         guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
         return .ok(.data(data, contentType: "application/json"))
     }
 
-    print("[xcode-build-testflight] Done.")
+    print("[xcode-build-testflight] Upload succeeded. altool output:")
+    print(uploadOutput)
+    print("[xcode-build-testflight] Done. Build \(newBuild ?? "?") should appear in App Store Connect → your app → TestFlight in 5–30 minutes.")
+    let outputTrimmed = fullOutput.count > 2000 ? String(fullOutput.suffix(2000)) : fullOutput
     let bodyDict: [String: Any] = [
         "success": true,
-        "output": fullOutput,
-        "error": ""
+        "output": outputTrimmed,
+        "error": "",
+        "buildNumber": newBuild ?? ""
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
     return .ok(.data(data, contentType: "application/json"))

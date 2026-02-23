@@ -189,6 +189,7 @@ struct ChatView: View {
             },
             onComplete: { error in
                 backgroundTask.end()
+                AppDelegate.notifyAgentRequestComplete(error: error)
                 Task { @MainActor in
                     if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
                         var content = messages[idx].content

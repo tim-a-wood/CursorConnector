@@ -133,6 +133,8 @@ Then restart the Companion. The **TestFlight** button in the iOS app (toolbar, n
 
 **Export failed?** Check: (1) Team ID on line 3 of `~/.cursor-connector-testflight` is correct (10 characters from [developer.apple.com/account](https://developer.apple.com/account)); (2) In Xcode, Signing & Capabilities has a Team and “Automatically manage signing” is on; (3) Try **Product → Archive** once in Xcode and see if it succeeds — if it fails there, fix signing first.
 
+**"No profiles for 'com.cursorconnector.app' were found"** — Do these in order (one-time): (1) **App Store Connect**: [appstoreconnect.apple.com](https://appstoreconnect.apple.com) → Apps → + → New App → set bundle ID to **com.cursorconnector.app** (same as in Xcode). (2) **Xcode**: open `ios/CursorConnector.xcodeproj` → CursorConnector target → **Signing & Capabilities** → choose your **Team**, turn on **Automatically manage signing**. (3) **Xcode**: **Product → Archive** and wait until the Organizer appears (Xcode will create the distribution profile). You can then close the Organizer. After that, the TestFlight button should work.
+
 ## Roadmap
 
 | Phase | Focus |

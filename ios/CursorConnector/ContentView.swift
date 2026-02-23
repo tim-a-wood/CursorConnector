@@ -29,6 +29,7 @@ struct ContentView: View {
                     emptyState
                 }
             }
+            .background(Color(white: 0.18))
             .task(id: "\(host):\(portInt):\(selectedProject?.path ?? "")") {
                 await connectionMonitorLoop()
             }
@@ -179,17 +180,20 @@ struct ContentView: View {
                 await MainActor.run {
                     isUploadingTestFlight = false
                     if result.success {
-                        buildAlertMessage = "Build uploaded to App Store Connect. In a few minutes it will appear in TestFlight — open TestFlight and tap Update, or use Settings → Open TestFlight to update."
+                        let buildLabel = (result.buildNumber.map { "Build \($0) " } ?? "")
+                        buildAlertMessage = "\(buildLabel)uploaded to App Store Connect.\n\nWhere to see it: App Store Connect → Your App → TestFlight. Processing usually takes 5–30 minutes; if it’s not there, check the Activity tab.\n\nStill don't see it? (1) App Store Connect → Apps must have an app with bundle ID com.cursorconnector.app — create it if missing. (2) Use the same Apple ID as in ~/.cursor-connector-testflight on your Mac. (3) Check Activity (bell icon) for processing errors."
                     } else {
-                        buildAlertMessage = (result.error.isEmpty ? "Archive, export, or upload failed." : result.error)
-                            + (result.output.isEmpty ? "" : "\n\n\(String(result.output.suffix(2000)))")
+                        let main = result.error.isEmpty ? "Archive, export, or upload failed." : result.error
+                        let detail = result.output.isEmpty ? "" : String(result.output.suffix(400))
+                        let detailTrimmed = detail.contains("\n") ? detail.split(separator: "\n").suffix(6).joined(separator: "\n") : detail
+                        buildAlertMessage = main + (detailTrimmed.isEmpty ? "" : "\n\nDetails:\n\(detailTrimmed)")
                     }
                     showBuildAlert = true
                 }
             } catch {
                 await MainActor.run {
                     isUploadingTestFlight = false
-                    buildAlertMessage = "Could not reach Mac: \(error.localizedDescription)\n\nCheck Host in Settings (e.g. Tailscale IP when away from Wi‑Fi)."
+                    buildAlertMessage = "Could not reach Mac: \(error.localizedDescription)\n\nCheck Host in Settings (e.g. Tailscale IP when away from Wi‑Fi).\n\nIf the request timed out: the upload may still have completed on your Mac. Check App Store Connect → your app → TestFlight after 10–30 minutes."
                     showBuildAlert = true
                 }
             }

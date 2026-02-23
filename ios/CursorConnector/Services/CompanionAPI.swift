@@ -426,6 +426,7 @@ enum CompanionAPI {
         var success: Bool
         var output: String
         var error: String
+        var buildNumber: String?
     }
 
     /// Triggers a build of the CursorConnector iOS app on the Mac and installs to the first connected device.
