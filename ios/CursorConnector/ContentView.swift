@@ -59,18 +59,12 @@ struct ContentView: View {
                 NavigationLink {
                     FileBrowserView(projectPath: project.path, host: host, port: portInt)
                 } label: {
-                    Label("Files", systemImage: "folder")
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                        .frame(maxWidth: .infinity)
+                    ToolbarButtonContent(icon: "folder", title: "Files")
                 }
                 NavigationLink {
                     GitView(projectPath: project.path, host: host, port: portInt)
                 } label: {
-                    Label("Git", systemImage: "arrow.triangle.branch")
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                        .frame(maxWidth: .infinity)
+                    ToolbarButtonContent(icon: "arrow.triangle.branch", title: "Git")
                 }
             }
             if project != nil {
@@ -78,42 +72,43 @@ struct ContentView: View {
                     triggerBuild()
                 } label: {
                     if isBuilding {
-                        ProgressView()
-                            .scaleEffect(0.8)
+                        VStack(spacing: 4) {
+                            ProgressView()
+                                .scaleEffect(0.9)
+                            Text("Build")
+                                .font(.caption2)
+                        }
+                        .frame(maxWidth: .infinity)
                     } else {
-                        Label("Build", systemImage: "hammer")
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
+                        ToolbarButtonContent(icon: "hammer", title: "Build")
                     }
                 }
-                .frame(maxWidth: .infinity)
                 .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
                 Button {
                     triggerTestFlightUpload()
                 } label: {
                     if isUploadingTestFlight {
-                        ProgressView()
-                            .scaleEffect(0.8)
+                        VStack(spacing: 4) {
+                            ProgressView()
+                                .scaleEffect(0.9)
+                            Text("TestFlight")
+                                .font(.caption2)
+                        }
+                        .frame(maxWidth: .infinity)
                     } else {
-                        Label("TestFlight", systemImage: "arrow.up.circle")
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.8)
+                        ToolbarButtonContent(icon: "arrow.up.circle", title: "TestFlight")
                     }
                 }
-                .frame(maxWidth: .infinity)
                 .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
             }
             Button {
                 showConfig = true
             } label: {
-                Label("Settings", systemImage: "gearshape")
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                ToolbarButtonContent(icon: "gearshape", title: "Settings")
             }
-            .frame(maxWidth: .infinity)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 10)
         .foregroundStyle(.white)
         .tint(.white)
     }
@@ -223,6 +218,23 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .padding(.top, 8)
             Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+/// Toolbar button with icon above label for consistent sizing.
+private struct ToolbarButtonContent: View {
+    let icon: String
+    let title: String
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 22))
+            Text(title)
+                .font(.caption2)
+                .lineLimit(1)
         }
         .frame(maxWidth: .infinity)
     }
