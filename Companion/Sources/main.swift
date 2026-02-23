@@ -629,6 +629,39 @@ private func releaseSleepAssertion() {
 let port: UInt16 = 9283
 let server = HttpServer()
 
+/// Returns a short string of IPs the user can use as Host (Tailscale first if present, then LAN).
+private func localIPHints() -> String {
+    var out: [String] = []
+    let tailscale = Process()
+    tailscale.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    tailscale.arguments = ["tailscale", "ip", "-4"]
+    tailscale.standardOutput = Pipe()
+    tailscale.standardError = FileHandle.nullDevice
+    if (try? tailscale.run()) != nil {
+        tailscale.waitUntilExit()
+        if tailscale.terminationStatus == 0,
+           let data = (tailscale.standardOutput as? Pipe)?.fileHandleForReading.readDataToEndOfFile(),
+           let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            out.append("Tailscale: \(s)")
+        }
+    }
+    let ifconfig = Process()
+    ifconfig.executableURL = URL(fileURLWithPath: "/usr/sbin/ipconfig")
+    ifconfig.arguments = ["getifaddr", "en0"]
+    ifconfig.standardOutput = Pipe()
+    ifconfig.standardError = FileHandle.nullDevice
+    if (try? ifconfig.run()) != nil {
+        ifconfig.waitUntilExit()
+        if ifconfig.terminationStatus == 0,
+           let data = (ifconfig.standardOutput as? Pipe)?.fileHandleForReading.readDataToEndOfFile(),
+           let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            out.append("Wi‑Fi (en0): \(s)")
+        }
+    }
+    if out.isEmpty { return " (run Tailscale or use your Mac’s IP from System Settings → Network)" }
+    return "\n  Use as Host in the app: " + out.joined(separator: " or ")
+}
+
 server.GET["/health"] = { _ in .ok(.text("OK")) }
 
 server.POST["/restart"] = { _ in
@@ -1551,7 +1584,9 @@ server.notFoundHandler = { request in
 }
 
 do {
-    try server.start(port)
+    // Listen on all interfaces (0.0.0.0) so the iOS app can connect when not on the same network (e.g. via Tailscale).
+    server.listenAddressIPv4 = "0.0.0.0"
+    try server.start(port, forceIPv4: true)
 
     // Prevent system idle sleep only (display may sleep to save battery). Keeps Mac reachable for the iOS app.
     let reason = "Cursor Connector Companion server" as CFString
@@ -1565,7 +1600,9 @@ do {
         print("Sleep prevention active (system will not idle-sleep; display may sleep to save battery).")
     }
 
-    print("CursorConnector Companion running on http://localhost:\(port)")
+    print("CursorConnector Companion running on http://localhost:\(port) (listening on all interfaces)")
+    print(localIPHints())
+    print("  If the app can’t connect from another network: System Settings → Network → Firewall → allow Companion (or turn firewall off to test).")
     print("  GET  /health        - health check")
     print("  GET  /projects      - list recent Cursor projects")
     print("  GET  /files/tree    - list directory (query: path=...)")
