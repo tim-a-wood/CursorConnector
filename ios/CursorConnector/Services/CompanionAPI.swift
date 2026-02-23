@@ -2,20 +2,28 @@ import Foundation
 
 enum CompanionAPI {
     static let defaultPort: Int = 9283
-    /// Agent can run up to 5 min on the server; wait slightly longer so we get the response.
-    static let promptTimeout: TimeInterval = 320
+    /// Agent can run up to 5 min on the server; use 10 min so suspend + resume doesn't cause spurious timeouts.
+    static let promptTimeout: TimeInterval = 600
     /// Timeout for file and other short requests. Generous so brief app suspend doesn’t cause spurious timeouts.
-    static let fileRequestTimeout: TimeInterval = 150
+    static let fileRequestTimeout: TimeInterval = 240
 
-    /// Retries the operation once on timeout or network error (e.g. after app suspend). Use for idempotent requests only.
+    /// Retries the operation up to twice on timeout or network error (e.g. after app suspend). Use for idempotent requests only.
     private static func withRetry<T>(_ operation: () async throws -> T) async rethrows -> T {
+        func isRetryable(_ error: Error) -> Bool {
+            let nse = error as NSError
+            return nse.domain == NSURLErrorDomain
+                && [NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost, NSURLErrorNotConnectedToInternet, NSURLErrorCancelled].contains(nse.code)
+        }
         do {
             return try await operation()
         } catch {
-            let retryable = (error as NSError).domain == NSURLErrorDomain
-                && ([NSURLErrorTimedOut, NSURLErrorNetworkConnectionLost, NSURLErrorNotConnectedToInternet, NSURLErrorCancelled].contains((error as NSError).code))
-            guard retryable else { throw error }
-            return try await operation()
+            guard isRetryable(error) else { throw error }
+            do {
+                return try await operation()
+            } catch {
+                guard isRetryable(error) else { throw error }
+                return try await operation()
+            }
         }
     }
 
@@ -77,26 +85,28 @@ enum CompanionAPI {
     }
 
     static func sendPrompt(path: String, prompt: String, host: String, port: Int = defaultPort) async throws -> PromptResponse {
-        guard let base = baseURL(host: host, port: port) else {
-            throw URLError(.badURL)
-        }
-        let url = base.appendingPathComponent("prompt")
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = promptTimeout
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(["path": path, "prompt": prompt])
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw URLError(.badServerResponse)
-        }
-        guard http.statusCode == 200 else {
-            if let body = String(data: data, encoding: .utf8), !body.isEmpty {
-                throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else {
+                throw URLError(.badURL)
             }
-            throw URLError(.badServerResponse)
+            let url = base.appendingPathComponent("prompt")
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = promptTimeout
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(["path": path, "prompt": prompt])
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                throw URLError(.badServerResponse)
+            }
+            guard http.statusCode == 200 else {
+                if let body = String(data: data, encoding: .utf8), !body.isEmpty {
+                    throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+                }
+                throw URLError(.badServerResponse)
+            }
+            return try JSONDecoder().decode(PromptResponse.self, from: data)
         }
-        return try JSONDecoder().decode(PromptResponse.self, from: data)
     }
 
     /// Called by the app delegate when the system delivers background URLSession events. Set and cleared by UIApplicationDelegate.
@@ -142,18 +152,19 @@ enum CompanionAPI {
     private static let backgroundSessionIdentifier = "com.cursorconnector.prompt-stream"
     private static let streamDelegate = StreamDelegate()
     /// Foreground session so response body is delivered incrementally (continuous feedback). Background sessions buffer until completion.
-    /// Timeouts set so agent can think for several minutes before first byte without the client timing out (default 60s would fire too soon).
+    /// Timeouts set so agent can think for many minutes and app can suspend without the client timing out (default 60s would fire too soon).
     private static let foregroundURLSession: URLSession = {
         let config = URLSessionConfiguration.default
-        let timeout: TimeInterval = 330  // match promptTimeout; must exceed URLSession default 60s
+        let timeout: TimeInterval = 600  // 10 min between data; survive long suspend or long agent think
         config.timeoutIntervalForRequest = timeout
-        config.timeoutIntervalForResource = timeout + 60
+        config.timeoutIntervalForResource = timeout + 120
         return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
     }()
     private static let backgroundURLSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: backgroundSessionIdentifier)
-        config.timeoutIntervalForRequest = 330
-        config.timeoutIntervalForResource = 330 + 60
+        config.timeoutIntervalForRequest = 600   // 10 min between data so suspend doesn't cause timeout
+        config.timeoutIntervalForResource = 720  // 12 min total for full response
+        config.waitsForConnectivity = true       // when app resumes, wait for network instead of failing
         return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
     }()
 
