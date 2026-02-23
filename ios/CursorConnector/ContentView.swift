@@ -7,6 +7,8 @@ struct ContentView: View {
     @State private var messages: [ChatMessage] = []
     @State private var showConfig = false
     @State private var isBuilding = false
+    @State private var isUploadingTestFlight = false
+    @State private var buildAlertTitle = "Build"
     @State private var buildAlertMessage: String?
     @State private var showBuildAlert = false
     /// When we have a project, periodically check /health. If unreachable (e.g. Mac slept), show banner and retry until back.
@@ -40,7 +42,7 @@ struct ContentView: View {
                         }
                     }
             }
-            .alert("Build", isPresented: $showBuildAlert) {
+            .alert(buildAlertTitle, isPresented: $showBuildAlert) {
                 Button("OK", role: .cancel) {}
             } message: {
                 if let msg = buildAlertMessage {
@@ -52,36 +54,63 @@ struct ContentView: View {
 
     @ViewBuilder
     private func toolbarButtonRow(project: ProjectEntry?) -> some View {
-        HStack(spacing: 16) {
+        HStack(spacing: 0) {
             if let project = project {
                 NavigationLink {
                     FileBrowserView(projectPath: project.path, host: host, port: portInt)
                 } label: {
                     Label("Files", systemImage: "folder")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity)
                 }
                 NavigationLink {
                     GitView(projectPath: project.path, host: host, port: portInt)
                 } label: {
-                    Label("Git", systemImage: "vault")
+                    Label("Git", systemImage: "arrow.triangle.branch")
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity)
                 }
             }
-            Spacer()
-            Button {
-                triggerBuild()
-            } label: {
-                if isBuilding {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Label("Build", systemImage: "hammer")
+            if project != nil {
+                Button {
+                    triggerBuild()
+                } label: {
+                    if isBuilding {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else {
+                        Label("Build", systemImage: "hammer")
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
                 }
+                .frame(maxWidth: .infinity)
+                .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
+                Button {
+                    triggerTestFlightUpload()
+                } label: {
+                    if isUploadingTestFlight {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else {
+                        Label("TestFlight", systemImage: "arrow.up.circle")
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
             }
-            .disabled(isBuilding || host.isEmpty)
             Button {
                 showConfig = true
             } label: {
                 Label("Settings", systemImage: "gearshape")
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
+            .frame(maxWidth: .infinity)
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
@@ -119,8 +148,9 @@ struct ContentView: View {
     }
 
     private func triggerBuild() {
-        guard !host.isEmpty, !isBuilding else { return }
+        guard !host.isEmpty, !isBuilding, !isUploadingTestFlight else { return }
         isBuilding = true
+        buildAlertTitle = "Build"
         Task {
             do {
                 let result = try await CompanionAPI.buildXcode(host: host, port: portInt)
@@ -138,6 +168,33 @@ struct ContentView: View {
                 await MainActor.run {
                     isBuilding = false
                     buildAlertMessage = "Could not reach Mac: \(error.localizedDescription)\n\nIn Settings, set Host to your Mac’s IP (e.g. 192.168.1.x). iPhone and Mac must be on the same Wi‑Fi."
+                    showBuildAlert = true
+                }
+            }
+        }
+    }
+
+    private func triggerTestFlightUpload() {
+        guard !host.isEmpty, !isBuilding, !isUploadingTestFlight else { return }
+        isUploadingTestFlight = true
+        buildAlertTitle = "TestFlight"
+        Task {
+            do {
+                let result = try await CompanionAPI.buildAndUploadTestFlight(host: host, port: portInt)
+                await MainActor.run {
+                    isUploadingTestFlight = false
+                    if result.success {
+                        buildAlertMessage = "Build uploaded to App Store Connect. In a few minutes it will appear in TestFlight — open TestFlight and tap Update, or use Settings → Open TestFlight to update."
+                    } else {
+                        buildAlertMessage = (result.error.isEmpty ? "Archive, export, or upload failed." : result.error)
+                            + (result.output.isEmpty ? "" : "\n\n\(String(result.output.suffix(2000)))")
+                    }
+                    showBuildAlert = true
+                }
+            } catch {
+                await MainActor.run {
+                    isUploadingTestFlight = false
+                    buildAlertMessage = "Could not reach Mac: \(error.localizedDescription)\n\nCheck Host in Settings (e.g. Tailscale IP when away from Wi‑Fi)."
                     showBuildAlert = true
                 }
             }

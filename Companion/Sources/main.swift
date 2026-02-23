@@ -134,8 +134,7 @@ private func patchCLIConfigToAuto() {
     model["aliases"] = ["auto"]
     config["model"] = model
     config["hasChangedDefaultModel"] = true
-    guard let out = try? JSONSerialization.data(withJSONObject: config),
-          let _ = String(data: out, encoding: .utf8) else { return }
+    guard let out = try? JSONSerialization.data(withJSONObject: config) else { return }
     try? out.write(to: configURL)
 }
 
@@ -309,6 +308,9 @@ func runAgentPromptStreamJSONSync(path: String, prompt: String, writeChunk: (Dat
         return -1
     }
 
+    // Send an immediate empty thinking event so the client gets real-time feedback (response starts flowing at once).
+    try? writeChunk(sseEvent(event: "thinking", data: ""))
+
     let outHandle = outPipe.fileHandleForReading
     var lineBuffer = ""
     var totalBytes = 0
@@ -332,10 +334,12 @@ func runAgentPromptStreamJSONSync(path: String, prompt: String, writeChunk: (Dat
             }
             let eventType: String? = {
                 if let t = obj["type"] as? String {
-                    if t.contains("thinking") || t == "reasoning" { return "thinking" }
+                    let lower = t.lowercased()
+                    if lower.contains("thinking") || lower == "reasoning" || lower.contains("reasoning") { return "thinking" }
                     return nil
                 }
-                if let k = obj["kind"] as? String, k.contains("thinking") { return "thinking" }
+                if let k = obj["kind"] as? String, k.lowercased().contains("thinking") { return "thinking" }
+                if let sub = obj["subtype"] as? String, sub.lowercased().contains("thinking") { return "thinking" }
                 return nil
             }()
             let payload: String = {
@@ -343,6 +347,16 @@ func runAgentPromptStreamJSONSync(path: String, prompt: String, writeChunk: (Dat
                 if let text = obj["text"] as? String { return text }
                 if let content = obj["content"] as? String { return content }
                 if let data = obj["data"] as? String { return data }
+                // Nested: message.content[0].text (stream-json assistant messages)
+                if let msg = obj["message"] as? [String: Any],
+                   let contentArr = msg["content"] as? [[String: Any]],
+                   let first = contentArr.first,
+                   let text = first["text"] as? String { return text }
+                if let contentArr = obj["content"] as? [[String: Any]],
+                   let first = contentArr.first,
+                   let text = first["text"] as? String { return text }
+                // Don't forward raw JSON metadata (e.g. type "thinking" subtype "completed", type "system") as content
+                if line.trimmingCharacters(in: .whitespaces).hasPrefix("{") { return "" }
                 return line
             }()
             if !payload.isEmpty {
@@ -784,9 +798,11 @@ let gitDiffHandler: (HttpRequest) -> HttpResponse = { request in
     return .ok(.data(data, contentType: "application/json"))
 }
 server.GET["/git/diff"] = gitDiffHandler
-server.GET["git/diff"] = gitDiffHandler
 
-struct GitDiffRequest: Codable { var path: String; var file: String }
+struct GitDiffRequest: Codable {
+    var path: String
+    var file: String
+}
 
 let gitDiffPostHandler: (HttpRequest) -> HttpResponse = { request in
     guard !request.body.isEmpty,
@@ -811,10 +827,11 @@ let gitDiffPostHandler: (HttpRequest) -> HttpResponse = { request in
     return .ok(.data(data, contentType: "application/json"))
 }
 server.POST["/git/diff"] = gitDiffPostHandler
-server.POST["git/diff"] = gitDiffPostHandler
 server.POST["/api/git-diff"] = gitDiffPostHandler
 
-struct GitPathRequest: Codable { var path: String }
+struct GitPathRequest: Codable {
+    var path: String
+}
 
 server.POST["/git/generate-message"] = { request in
     let body = request.body
@@ -1182,6 +1199,128 @@ struct XcodeBuildResponse: Codable {
     var error: String
 }
 
+// MARK: - Build and upload to TestFlight (no device required)
+
+let testflightCredentialsPath = (FileManager.default.homeDirectoryForCurrentUser.path as NSString).appendingPathComponent(".cursor-connector-testflight")
+let testflightBuildTimeoutSeconds: TimeInterval = 600
+
+/// Read Apple ID and app-specific password from ~/.cursor-connector-testflight (line 1: Apple ID, line 2: app-specific password, optional line 3: team ID).
+func readTestFlightCredentials() -> (appleId: String, appSpecificPassword: String, teamID: String?)? {
+    guard let content = try? String(contentsOfFile: testflightCredentialsPath, encoding: .utf8) else { return nil }
+    let lines = content.split(separator: "\n", omittingEmptySubsequences: false).map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    guard lines.count >= 2 else { return nil }
+    let teamID = lines.count >= 3 && lines[2].count >= 10 ? lines[2] : nil
+    return (lines[0], lines[1], teamID)
+}
+
+/// Run xcodebuild archive. Returns (archivePath, combinedOutput, exitCode).
+func runXcodeArchive(projectPath: String) -> (archivePath: String?, output: String, exitCode: Int32) {
+    let projectFile = (projectPath as NSString).appendingPathComponent(xcodeProjectName)
+    let archiveDir = (NSTemporaryDirectory() as NSString).appendingPathComponent("CursorConnector-Archive-\(UUID().uuidString.prefix(8))")
+    try? FileManager.default.createDirectory(atPath: archiveDir, withIntermediateDirectories: true)
+    let archivePath = (archiveDir as NSString).appendingPathComponent("CursorConnector.xcarchive")
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    process.arguments = [
+        "xcodebuild",
+        "-project", projectFile,
+        "-scheme", xcodeSchemeName,
+        "-configuration", "Release",
+        "-archivePath", archivePath,
+        "-allowProvisioningUpdates",
+        "archive"
+    ]
+    process.currentDirectoryURL = URL(fileURLWithPath: projectPath)
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return (nil, "Error: \(error.localizedDescription)", -1)
+    }
+    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let outStr = String(data: outData, encoding: .utf8) ?? ""
+    let errStr = String(data: errData, encoding: .utf8) ?? ""
+    let combined = errStr.isEmpty ? outStr : "\(outStr)\n\(errStr)"
+    guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: archivePath) else {
+        return (nil, combined, process.terminationStatus)
+    }
+    return (archivePath, combined, 0)
+}
+
+/// Export .xcarchive to .ipa for App Store. Returns (ipaPath, output, exitCode).
+func runExportArchive(archivePath: String, exportDir: String, teamID: String?) -> (ipaPath: String?, output: String, exitCode: Int32) {
+    let plistPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("ExportOptions-\(UUID().uuidString.prefix(8)).plist")
+    defer { try? FileManager.default.removeItem(atPath: plistPath) }
+    var plistDict: [String: Any] = ["method": "app-store"]
+    if let tid = teamID, !tid.isEmpty {
+        plistDict["teamID"] = tid
+    }
+    guard let plistData = try? PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0),
+          (try? plistData.write(to: URL(fileURLWithPath: plistPath))) != nil else {
+        return (nil, "Error: could not write ExportOptions.plist", -1)
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    process.arguments = [
+        "xcodebuild", "-exportArchive",
+        "-archivePath", archivePath,
+        "-exportOptionsPlist", plistPath,
+        "-exportPath", exportDir
+    ]
+    process.currentDirectoryURL = URL(fileURLWithPath: (archivePath as NSString).deletingLastPathComponent)
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return (nil, "Error: \(error.localizedDescription)", -1)
+    }
+    process.waitUntilExit()
+    let outStr = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let combined = errStr.isEmpty ? outStr : "\(outStr)\n\(errStr)"
+    let ipaPath = (exportDir as NSString).appendingPathComponent("\(xcodeSchemeName).ipa")
+    guard process.terminationStatus == 0, FileManager.default.fileExists(atPath: ipaPath) else {
+        return (nil, combined, process.terminationStatus)
+    }
+    return (ipaPath, combined, 0)
+}
+
+/// Upload .ipa to App Store Connect via altool. Returns (output, exitCode).
+func runAltoolUpload(ipaPath: String, appleId: String, appSpecificPassword: String) -> (output: String, exitCode: Int32) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+    process.arguments = [
+        "altool", "--upload-app",
+        "-f", ipaPath,
+        "-t", "ios",
+        "-u", appleId,
+        "-p", appSpecificPassword
+    ]
+    let outPipe = Pipe()
+    let errPipe = Pipe()
+    process.standardOutput = outPipe
+    process.standardError = errPipe
+    do {
+        try process.run()
+    } catch {
+        return ("Error: \(error.localizedDescription)", -1)
+    }
+    process.waitUntilExit()
+    let outStr = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let errStr = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return (errStr.isEmpty ? outStr : "\(outStr)\n\(errStr)", process.terminationStatus)
+}
+
 // If the client disconnects before the build finishes (e.g. timeout), Swifter may log "Failed to send response: writeFailed(\"Broken pipe\")". The build can still have succeeded.
 server.POST["/xcode-build"] = { request in
     var repoPath: String?
@@ -1198,7 +1337,7 @@ server.POST["/xcode-build"] = { request in
     print("[xcode-build] Project: \(projectPath)")
     print("[xcode-build] Finding device (xcodebuild -showdestinations, may take 20–30s)...")
     guard let deviceId = getFirstConnectedDeviceID(projectPath: projectPath) else {
-        let bodyDict: [String: Any] = ["success": false, "output": "", "error": "No connected iOS device found. Connect your iPhone and ensure it is trusted."]
+        let bodyDict: [String: Any] = ["success": false, "output": "", "error": "No iOS device visible to Xcode. Build & install only work when the iPhone is connected to this Mac by USB, or on the same Wi‑Fi with wireless debugging. (Tailscale does not make the device visible to Xcode.) Connect via cable or same Wi‑Fi, then try again."]
         guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
         return .ok(.data(data, contentType: "application/json"))
     }
@@ -1210,6 +1349,72 @@ server.POST["/xcode-build"] = { request in
         "success": exitCode == 0,
         "output": output,
         "error": exitCode == 0 ? "" : (output.split(separator: "\n").last.map(String.init) ?? "Build or install failed")
+    ]
+    guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
+server.POST["/xcode-build-testflight"] = { request in
+    var repoPath: String?
+    if !request.body.isEmpty,
+       let decoded = try? JSONDecoder().decode(XcodeBuildRequest.self, from: Data(request.body)) {
+        repoPath = decoded.repoPath
+    }
+    print("[xcode-build-testflight] Resolving project path...")
+    guard let projectPath = resolveIOSProjectPath(repoPath: repoPath) else {
+        let bodyDict: [String: Any] = ["success": false, "output": "", "error": "iOS project not found. Run Companion from the CursorConnector repo root, or send repoPath in the request body."]
+        guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+        return .ok(.data(data, contentType: "application/json"))
+    }
+    guard let creds = readTestFlightCredentials() else {
+        let msg = "TestFlight credentials not found. Create ~/.cursor-connector-testflight with:\n  Line 1: your Apple ID (email)\n  Line 2: app-specific password (from appleid.apple.com → Sign-In and Security → App-Specific Passwords)\n  Line 3 (optional): Team ID (10 chars, from developer.apple.com/account)"
+        let bodyDict: [String: Any] = ["success": false, "output": "", "error": msg]
+        guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+        return .ok(.data(data, contentType: "application/json"))
+    }
+    print("[xcode-build-testflight] Project: \(projectPath)")
+    var fullOutput = ""
+
+    print("[xcode-build-testflight] Archiving...")
+    let (archivePathOpt, archiveOutput, archiveCode) = runXcodeArchive(projectPath: projectPath)
+    fullOutput += archiveOutput
+    guard let archivePath = archivePathOpt, archiveCode == 0 else {
+        let bodyDict: [String: Any] = ["success": false, "output": fullOutput, "error": "Archive failed. Check signing & capabilities in Xcode."]
+        guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+        return .ok(.data(data, contentType: "application/json"))
+    }
+    let archiveDir = (archivePath as NSString).deletingLastPathComponent
+
+    let exportDir = (NSTemporaryDirectory() as NSString).appendingPathComponent("CursorConnector-Export-\(UUID().uuidString.prefix(8))")
+    try? FileManager.default.createDirectory(atPath: exportDir, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(atPath: exportDir)
+        try? FileManager.default.removeItem(atPath: archiveDir)
+    }
+
+    print("[xcode-build-testflight] Exporting IPA...")
+    let (ipaPathOpt, exportOutput, exportCode) = runExportArchive(archivePath: archivePath, exportDir: exportDir, teamID: creds.teamID)
+    fullOutput += "\n" + exportOutput
+    guard let ipaPath = ipaPathOpt, exportCode == 0 else {
+        let bodyDict: [String: Any] = ["success": false, "output": fullOutput, "error": "Export failed. Ensure your Team ID is correct (line 3 of credentials file) and the app is set up for App Store distribution in Xcode."]
+        guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+        return .ok(.data(data, contentType: "application/json"))
+    }
+
+    print("[xcode-build-testflight] Uploading to App Store Connect...")
+    let (uploadOutput, uploadCode) = runAltoolUpload(ipaPath: ipaPath, appleId: creds.appleId, appSpecificPassword: creds.appSpecificPassword)
+    fullOutput += "\n" + uploadOutput
+    if uploadCode != 0 {
+        let bodyDict: [String: Any] = ["success": false, "output": fullOutput, "error": "Upload failed. Check Apple ID and app-specific password in ~/.cursor-connector-testflight."]
+        guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
+        return .ok(.data(data, contentType: "application/json"))
+    }
+
+    print("[xcode-build-testflight] Done.")
+    let bodyDict: [String: Any] = [
+        "success": true,
+        "output": fullOutput,
+        "error": ""
     ]
     guard let data = try? JSONSerialization.data(withJSONObject: bodyDict) else { return .internalServerError }
     return .ok(.data(data, contentType: "application/json"))
@@ -1245,13 +1450,14 @@ do {
     print("  POST /prompt        - run agent (body: {\"path\": \"/project/path\", \"prompt\": \"...\"})")
     print("  POST /prompt-stream - run agent with SSE streaming output")
     print("  GET  /git/status    - git status (query: path=...)")
-    print("  GET  /git/diff     - file diff (query: path=..., file=...)")
+    print("  GET  /git/diff - file diff (query: path=..., file=...)")
     print("  POST /api/git-diff - file diff (body: {\"path\": \"...\", \"file\": \"...\"}) [used by iOS app]")
     print("  POST /git/generate-message - generate commit message (body: {\"path\": \"...\"})")
     print("  POST /git/commit    - git add -A && commit (body: {\"path\": \"...\", \"message\": \"...\"})")
     print("  POST /git/push     - git push (body: {\"path\": \"...\"})")
     print("  GET  /github/actions - GitHub Actions workflow runs (query: path=...)")
     print("  POST /xcode-build  - build iOS app and install to connected device (body: optional {\"repoPath\": \"/path\"})")
+    print("  POST /xcode-build-testflight - archive, export IPA, upload to TestFlight (body: optional {\"repoPath\": \"/path\"}); needs ~/.cursor-connector-testflight")
     print("  POST /restart       - exit process (use with a restarter script to restart)")
     RunLoop.main.run()
 } catch {

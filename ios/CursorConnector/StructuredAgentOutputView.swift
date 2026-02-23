@@ -72,6 +72,8 @@ private func parseOutput(_ raw: String) -> [OutputSegment] {
 
 struct StructuredAgentOutputView: View {
     let output: String
+    var paragraphSpacing: CGFloat = 14
+    var lineSpacing: CGFloat = 6
 
     private var segments: [OutputSegment] {
         parseOutput(output)
@@ -79,7 +81,7 @@ struct StructuredAgentOutputView: View {
 
     var body: some View {
         if output.isEmpty {
-            emptyView
+            EmptyView()
         } else {
             VStack(alignment: .leading, spacing: 24) {
                 ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
@@ -88,12 +90,6 @@ struct StructuredAgentOutputView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-    }
-
-    private var emptyView: some View {
-        Text("No output yet.")
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
@@ -108,7 +104,7 @@ struct StructuredAgentOutputView: View {
 
     private func markdownBlock(_ text: String) -> some View {
         let paragraphs = text.split(separator: "\n\n", omittingEmptySubsequences: true)
-        return VStack(alignment: .leading, spacing: 14) {
+        return VStack(alignment: .leading, spacing: paragraphSpacing) {
             ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, raw in
                 let block = String(raw)
                 Group {
@@ -118,7 +114,7 @@ struct StructuredAgentOutputView: View {
                         Text(block)
                     }
                 }
-                .lineSpacing(6)
+                .lineSpacing(lineSpacing)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -134,12 +130,15 @@ struct StructuredAgentOutputView: View {
                     .fontWeight(.medium)
                     .foregroundStyle(.secondary)
             }
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(body)
-                    .font(.system(.body, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            ScrollView(.vertical, showsIndicators: true) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(body)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
+            .frame(maxHeight: 280)
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.primary.opacity(0.06))

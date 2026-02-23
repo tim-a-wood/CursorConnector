@@ -33,3 +33,6 @@ Package.resolved
 # Optional: local config (uncomment if you want to keep secrets out of repo)
 # .cursor-connector-api-key
 # .cursor-connector-projects.json
+
+# TestFlight credentials (Apple ID + app-specific password) — never commit
+.cursor-connector-testflight

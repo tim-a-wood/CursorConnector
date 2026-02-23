@@ -19,10 +19,20 @@ enum CompanionAPI {
         }
     }
 
+    /// If `host` is a full URL (contains "://"), use it as the base and ignore `port`. Otherwise build http://host:port.
     static func baseURL(host: String, port: Int = defaultPort) -> URL? {
+        let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("://") {
+            guard let parsed = URL(string: trimmed),
+                  var comp = URLComponents(url: parsed, resolvingAgainstBaseURL: false) else { return nil }
+            comp.path = ""
+            comp.query = nil
+            comp.fragment = nil
+            return comp.url
+        }
         var components = URLComponents()
         components.scheme = "http"
-        components.host = host
+        components.host = trimmed.isEmpty ? nil : trimmed
         components.port = port
         return components.url
     }
@@ -300,12 +310,8 @@ enum CompanionAPI {
 
     static func fetchGitDiff(path: String, file: String, host: String, port: Int = defaultPort) async throws -> String {
         try await withRetry {
-            var components = URLComponents()
-            components.scheme = "http"
-            components.host = host
-            components.port = port
-            components.path = "/api/git-diff"
-            guard let url = components.url else { throw URLError(.badURL) }
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            let url = base.appendingPathComponent("api").appendingPathComponent("git-diff")
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
             request.timeoutInterval = fileRequestTimeout
@@ -429,6 +435,26 @@ enum CompanionAPI {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = buildTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(XcodeBuildRequest(repoPath: repoPath))
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        guard http.statusCode == 200 else {
+            let body = (data.isEmpty ? nil : String(data: data, encoding: .utf8)) ?? "HTTP \(http.statusCode)"
+            throw NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: body])
+        }
+        return try JSONDecoder().decode(XcodeBuildResponse.self, from: data)
+    }
+
+    /// Builds an archive on the Mac, exports IPA, and uploads to App Store Connect (TestFlight). No device required. Use when on Tailscale.
+    static let buildTestFlightTimeout: TimeInterval = 620
+
+    static func buildAndUploadTestFlight(repoPath: String? = nil, host: String, port: Int = defaultPort) async throws -> XcodeBuildResponse {
+        guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+        let url = base.appendingPathComponent("xcode-build-testflight")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = buildTestFlightTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(XcodeBuildRequest(repoPath: repoPath))
         let (data, response) = try await URLSession.shared.data(for: request)
