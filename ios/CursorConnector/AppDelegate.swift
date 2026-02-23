@@ -46,4 +46,19 @@ extension AppDelegate {
         )
         UNUserNotificationCenter.current().add(request)
     }
+
+    /// Schedules a local notification when a TestFlight upload completes. Call after buildAndUploadTestFlight succeeds.
+    static func notifyTestFlightUploadComplete(buildNumber: String?) {
+        let content = UNMutableNotificationContent()
+        content.title = "TestFlight"
+        let buildLabel = buildNumber.map { "Build \($0) " } ?? ""
+        content.body = "\(buildLabel)uploaded to App Store Connect. Processing usually takes 5–30 minutes; then install from the TestFlight app."
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "testflight-upload-\(buildNumber ?? UUID().uuidString)",
+            content: content,
+            trigger: UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
 }

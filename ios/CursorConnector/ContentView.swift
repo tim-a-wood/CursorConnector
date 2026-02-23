@@ -180,6 +180,7 @@ struct ContentView: View {
                 await MainActor.run {
                     isUploadingTestFlight = false
                     if result.success {
+                        AppDelegate.notifyTestFlightUploadComplete(buildNumber: result.buildNumber)
                         let buildLabel = (result.buildNumber.map { "Build \($0) " } ?? "")
                         buildAlertMessage = "\(buildLabel)uploaded to App Store Connect.\n\nWhere to see it: App Store Connect → Your App → TestFlight. Processing usually takes 5–30 minutes; if it’s not there, check the Activity tab.\n\nStill don't see it? (1) App Store Connect → Apps must have an app with bundle ID com.cursorconnector.app — create it if missing. (2) Use the same Apple ID as in ~/.cursor-connector-testflight on your Mac. (3) Check Activity (bell icon) for processing errors."
                     } else {

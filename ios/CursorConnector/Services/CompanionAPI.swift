@@ -102,7 +102,7 @@ enum CompanionAPI {
     /// Called by the app delegate when the system delivers background URLSession events. Set and cleared by UIApplicationDelegate.
     static var backgroundSessionCompletionHandler: (() -> Void)?
 
-    /// Streams agent output via Server-Sent Events. Uses a *foreground* URLSession so chunks are delivered in real time (background sessions buffer the response until completion, so continuous feedback would not work).
+    /// Streams agent output via Server-Sent Events. Uses a *background* URLSession so the transfer continues when the app is suspended (e.g. user switches apps on another network). Chunks are delivered in real time while in foreground; when returning from background we may receive buffered data and completion.
     static func sendPromptStream(
         path: String,
         prompt: String,
@@ -134,7 +134,7 @@ enum CompanionAPI {
             return
         }
         streamDelegate.setCallbacks(onChunk: onChunk, onThinkingChunk: onThinkingChunk, onComplete: onComplete)
-        let task = foregroundURLSession.dataTask(with: request)
+        let task = backgroundURLSession.dataTask(with: request)
         streamDelegate.task = task
         task.resume()
     }
@@ -152,6 +152,8 @@ enum CompanionAPI {
     }()
     private static let backgroundURLSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: backgroundSessionIdentifier)
+        config.timeoutIntervalForRequest = 330
+        config.timeoutIntervalForResource = 330 + 60
         return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
     }()
 
@@ -506,10 +508,9 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
             }
         }
         guard !payload.isEmpty else { return }
-        if eventType == "thinking" {
-            onThinkingChunk?(payload)
-        } else {
-            onChunk?(payload)
+        let block = eventType == "thinking" ? onThinkingChunk : onChunk
+        if let block = block {
+            DispatchQueue.main.async { block(payload) }
         }
     }
 
@@ -537,27 +538,32 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
                 }
             }
             if !payload.isEmpty {
-                if eventType == "thinking" {
-                    onThinkingChunk?(payload)
-                } else {
-                    onChunk?(payload)
+                let block = eventType == "thinking" ? onThinkingChunk : onChunk
+                if let block = block {
+                    DispatchQueue.main.async { block(payload) }
                 }
             }
         }
-        onComplete?(error)
+        if let onComplete = onComplete {
+            DispatchQueue.main.async { onComplete(error) }
+        }
         clearCallbacks()
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         guard let http = response as? HTTPURLResponse else {
             completionHandler(.cancel)
-            onComplete?(URLError(.badServerResponse))
+            if let onComplete = onComplete {
+                DispatchQueue.main.async { onComplete(URLError(.badServerResponse)) }
+            }
             clearCallbacks()
             return
         }
         guard http.statusCode == 200 else {
             completionHandler(.cancel)
-            onComplete?(NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"]))
+            if let onComplete = onComplete {
+                DispatchQueue.main.async { onComplete(NSError(domain: "CompanionAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "HTTP \(http.statusCode)"])) }
+            }
             clearCallbacks()
             return
         }

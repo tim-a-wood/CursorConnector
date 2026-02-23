@@ -53,6 +53,20 @@ struct ChatView: View {
                         .padding(.vertical, 10)
                         .id("bottomThinking")
                     }
+                    if !sending, let last = messages.last, last.role == .assistant, !last.content.isEmpty {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text("Request complete")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .id("bottomComplete")
+                    }
                 }
                 .padding()
             }
@@ -72,6 +86,8 @@ struct ChatView: View {
         withAnimation(.easeOut(duration: 0.2)) {
             if sending {
                 proxy.scrollTo("bottomThinking", anchor: .bottom)
+            } else if let last = messages.last, last.role == .assistant, !last.content.isEmpty {
+                proxy.scrollTo("bottomComplete", anchor: .bottom)
             } else if let last = messages.last {
                 proxy.scrollTo(last.id, anchor: .bottom)
             }
@@ -195,6 +211,13 @@ struct ChatView: View {
                         var content = messages[idx].content
                         if let r = content.range(of: "\n[exit: ") {
                             content = String(content[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        // Strip trailing "return 0" (or similar) so we show the "Request complete" indicator instead
+                        for suffix in ["\nreturn 0", "return 0"] {
+                            if content.hasSuffix(suffix) {
+                                content = String(content.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                                break
+                            }
                         }
                         messages[idx].content = content
                         if let err = error {
