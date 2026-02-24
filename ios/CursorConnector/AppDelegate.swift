@@ -47,17 +47,22 @@ class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDele
 // MARK: - Agent completion notification
 
 extension AppDelegate {
-    /// Schedules a local notification when a Cursor agent request completes. Call from the stream's onComplete callback.
-    /// Skips notification when the request was cancelled (e.g. user sent another message or navigated away).
-    static func notifyAgentRequestComplete(error: Error?) {
-        if let error = error, Self.isCancelledError(error) {
+    /// Schedules a local notification when a Cursor agent request completes.
+    /// When `fromBackgroundSession` is true (completion delivered by background URLSession delegate, e.g. after app was suspended or relaunched), always notifies including for cancellation (-999), since that may be due to suspend rather than user cancel.
+    /// When false, skips notification for cancellation (-999) to avoid spurious "Request failed" when the user cancelled in-app.
+    static func notifyAgentRequestComplete(error: Error?, fromBackgroundSession: Bool = false) {
+        if !fromBackgroundSession, let error = error, Self.isCancelledError(error) {
             return
         }
         let content = UNMutableNotificationContent()
         content.title = "Cursor Agent"
-        content.body = error == nil
-            ? "Request complete."
-            : "Request failed: \(error!.localizedDescription)"
+        if let err = error {
+            content.body = Self.isCancelledError(err)
+                ? "Request was interrupted while the app was in the background."
+                : "Request failed: \(err.localizedDescription)"
+        } else {
+            content.body = "Request complete."
+        }
         content.sound = .default
         let request = UNNotificationRequest(
             identifier: UUID().uuidString,

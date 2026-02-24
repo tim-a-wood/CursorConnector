@@ -103,21 +103,26 @@ struct ChatView: View {
 
     private var inputBar: some View {
         VStack(spacing: 0) {
+            Rectangle()
+                .fill(Color.primary.opacity(0.12))
+                .frame(height: 1.0 / UIScreen.main.scale)
+
             if let err = sendError {
                 Text(err)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
             }
             if let imageData = attachedImage, let uiImage = UIImage(data: imageData) {
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     Image(uiImage: uiImage)
                         .resizable()
                         .scaledToFill()
-                        .frame(width: 44, height: 44)
+                        .frame(width: 36, height: 36)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
-                    Text("Screenshot attached")
+                    Text("Image attached")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -126,66 +131,93 @@ struct ChatView: View {
                         selectedPhotoItem = nil
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.title3)
+                            .font(.body)
                             .foregroundStyle(.secondary)
                     }
+                    .accessibilityLabel("Remove attachment")
                 }
-                .padding(.horizontal, 12)
-                .padding(.top, 6)
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 4)
             }
-            HStack(alignment: .center, spacing: 10) {
-                TextField("Message Cursor…", text: $inputText, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .padding(12)
-                    .background(Color(.secondarySystemGroupedBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 20))
-                    .lineLimit(1...6)
-                    .focused($inputFocused)
 
-                PhotosPicker(
-                    selection: $selectedPhotoItem,
-                    matching: .images,
-                    photoLibrary: .shared()
-                ) {
-                    Image(systemName: "camera.fill")
-                        .font(.system(size: 24))
-                        .foregroundStyle(.white)
-                }
-                .onChange(of: selectedPhotoItem) { _, newItem in
-                    Task {
-                        guard let newItem = newItem else {
-                            attachedImage = nil
-                            return
-                        }
-                        if let loaded = try? await newItem.loadTransferable(type: ImageDataTransfer.self) {
-                            attachedImage = loaded.data
-                        }
-                    }
-                }
-                .accessibilityLabel("Attach screenshot or photo")
-
-                Button {
-                    inputFocused.toggle()
-                } label: {
-                    Image(systemName: inputFocused ? "keyboard.chevron.compact.down" : "keyboard")
-                        .font(.system(size: 32))
-                        .foregroundStyle(.white)
-                }
-                .accessibilityLabel(inputFocused ? "Hide keyboard" : "Show keyboard")
-
-                Button {
-                    sendMessage()
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 32))
-                        .foregroundStyle(canSend ? Color.accentColor : Color.gray)
-                }
-                .disabled(!canSend)
+            // Left: utility buttons. Right: one compose bubble (text + send) for clear hierarchy.
+            HStack(alignment: .bottom, spacing: 10) {
+                inputBarUtilityButtons
+                composeBubble
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
         }
         .background(Color(.systemGroupedBackground))
+    }
+
+    /// Attach and keyboard toggle — grouped on the left so the compose bubble is the main focus.
+    private var inputBarUtilityButtons: some View {
+        HStack(spacing: 4) {
+            PhotosPicker(
+                selection: $selectedPhotoItem,
+                matching: .images,
+                photoLibrary: .shared()
+            ) {
+                Image(systemName: "photo.badge.plus")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .onChange(of: selectedPhotoItem) { _, newItem in
+                Task {
+                    guard let newItem = newItem else {
+                        attachedImage = nil
+                        return
+                    }
+                    if let loaded = try? await newItem.loadTransferable(type: ImageDataTransfer.self) {
+                        attachedImage = loaded.data
+                    }
+                }
+            }
+            .accessibilityLabel("Attach photo or screenshot")
+
+            Button {
+                inputFocused.toggle()
+            } label: {
+                Image(systemName: inputFocused ? "keyboard.chevron.compact.down" : "keyboard")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel(inputFocused ? "Hide keyboard" : "Show keyboard")
+        }
+    }
+
+    /// Single bubble: text field + send. Primary action is clearly one unit.
+    private var composeBubble: some View {
+        HStack(alignment: .bottom, spacing: 6) {
+            TextField("Message Cursor…", text: $inputText, axis: .vertical)
+                .textFieldStyle(.plain)
+                .padding(.leading, 14)
+                .padding(.trailing, 6)
+                .padding(.vertical, 10)
+                .lineLimit(1...6)
+                .focused($inputFocused)
+                .frame(minHeight: 44)
+                .layoutPriority(1)
+
+            Button {
+                sendMessage()
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 28))
+                    .foregroundStyle(canSend ? Color.accentColor : Color(.tertiaryLabel))
+            }
+            .frame(width: 36, height: 36)
+            .disabled(!canSend)
+            .accessibilityLabel("Send")
+        }
+        .background(Color(.tertiarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 22))
     }
 
     private func sendMessage() {
@@ -217,8 +249,6 @@ struct ChatView: View {
         let backgroundTask = BackgroundTaskHolder()
         backgroundTask.begin()
 
-        var hasStrippedPrompt = false
-        var lastContentChunk = ""
         // Include prior messages so the agent has context when continuing a chat.
         let history = messages.dropLast(2)
         let newUserContent = text.isEmpty ? "See the attached screenshot(s) above." : text
@@ -232,75 +262,41 @@ struct ChatView: View {
             }.joined(separator: "\n\n")
             promptForAgent = "Previous conversation:\n\n\(historyBlock)\n\nUser: \(newUserContent)"
         }
-        let trimmedPrompt = newUserContent.trimmingCharacters(in: .whitespacesAndNewlines)
         let imageBase64: [String]? = imageToSend.map { [$0.base64EncodedString()] }
 
-        CompanionAPI.sendPromptStream(
+        // Use a background *download* task so the request continues when the app is suspended (streaming data tasks are cancelled on suspend).
+        CompanionAPI.sendPromptViaBackgroundDownload(
             path: project.path,
             prompt: promptForAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "See the attached screenshot(s) above." : promptForAgent,
             host: host,
             port: port,
             imageBase64: imageBase64,
-            streamThinking: true,
-            onChunk: { chunk in
-                Task { @MainActor in
-                    if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
-                        if chunk == lastContentChunk { return }
-                        lastContentChunk = chunk
-                        messages[idx].content += chunk
-                        if !hasStrippedPrompt, !trimmedPrompt.isEmpty {
-                            let trimmedContent = messages[idx].content.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if trimmedContent.hasPrefix(trimmedPrompt) {
-                                let after = String(trimmedContent.dropFirst(trimmedPrompt.count))
-                                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                                messages[idx].content = after
-                                hasStrippedPrompt = true
-                            }
-                        }
-                        scrollTrigger += 1
-                    }
-                }
-            },
-            onThinkingChunk: { chunk in
-                Task { @MainActor in
-                    if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
-                        if !messages[idx].content.isEmpty {
-                            // Agent switched back to thinking after already providing output; start a new bubble.
-                            let newMsg = ChatMessage(id: UUID(), role: .assistant, content: "", thinking: chunk)
-                            messages.append(newMsg)
-                            currentAssistantMsgId = newMsg.id
-                        } else {
-                            messages[idx].thinking += chunk
-                        }
-                        scrollTrigger += 1
-                    }
-                }
-            },
-            onComplete: { error in
+            onComplete: { result in
                 backgroundTask.end()
-                AppDelegate.notifyAgentRequestComplete(error: error)
-                let isCancelled = error.map { AppDelegate.isCancelledError($0) } ?? false
                 Task { @MainActor in
                     if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
-                        var content = messages[idx].content
-                        if let r = content.range(of: "\n[exit: ") {
-                            content = String(content[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        }
-                        // Strip trailing "return 0" (or similar) so we show the "Request complete" indicator instead
-                        for suffix in ["\nreturn 0", "return 0"] {
-                            if content.hasSuffix(suffix) {
-                                content = String(content.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                                break
+                        switch result {
+                        case .success(let response):
+                            var content = response.output
+                            if let r = content.range(of: "\n[exit: ") {
+                                content = String(content[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                             }
-                        }
-                        messages[idx].content = content
-                        if let err = error, !isCancelled {
-                            messages[idx].content += "\n\nError: \(err.localizedDescription)"
-                            sendError = err.localizedDescription
+                            for suffix in ["\nreturn 0", "return 0"] {
+                                if content.hasSuffix(suffix) {
+                                    content = String(content.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                                    break
+                                }
+                            }
+                            messages[idx].content = content
+                        case .failure(let err):
+                            let isCancelled = AppDelegate.isCancelledError(err)
+                            if !isCancelled {
+                                messages[idx].content += "\n\nError: \(err.localizedDescription)"
+                                sendError = err.localizedDescription
+                            }
                         }
                     }
                     sending = false
-                    // Persist conversation so it can be revisited later.
                     if let cid = conversationId {
                         let title = Conversation.titleFromMessages(messages)
                         ConversationStore.shared.updateConversation(projectPath: project.path, id: cid, messages: messages, title: title)

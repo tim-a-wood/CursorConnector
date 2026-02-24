@@ -21,8 +21,13 @@ struct ContentView: View {
     @State private var recentProjects: [ProjectEntry] = []
     @State private var loadingRecentProjects = false
     @State private var recentProjectsError: String?
+    @State private var selectedTab: ProjectTab = .chat
 
     private var portInt: Int { Int(port) ?? CompanionAPI.defaultPort }
+
+    private enum ProjectTab: Int, CaseIterable {
+        case chat, files, git
+    }
 
     var body: some View {
         NavigationStack {
@@ -30,21 +35,13 @@ struct ContentView: View {
                 if selectedProject != nil, !serverReachable {
                     reconnectingBanner
                 }
-                toolbarButtonRow(project: selectedProject)
                 if let project = selectedProject {
-                    ChatView(
-                        project: project,
-                        host: host,
-                        port: portInt,
-                        messages: $messages,
-                        conversationId: $selectedConversationId,
-                        conversationSummaries: $conversationSummaries
-                    )
+                    projectTabContent(project: project)
                 } else {
                     emptyState
                 }
             }
-            .background(Color(white: 0.18))
+            .background(Color(white: 0.12))
             .task(id: "\(host):\(portInt):\(selectedProject?.path ?? "")") {
                 await connectionMonitorLoop()
             }
@@ -57,12 +54,61 @@ struct ContentView: View {
                     recentProjects = []
                     recentProjectsError = nil
                     selectedConversationId = nil
+                    selectedTab = .chat
                     messages = []
                     conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
                 }
             }
-            .navigationTitle(selectedProject != nil ? (selectedProject!.label ?? (selectedProject!.path as NSString).lastPathComponent) : "Cursor")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(.bar, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text(navigationTitle)
+                        .font(.headline)
+                }
+                ToolbarItem(placement: .topBarLeading) {
+                    if selectedProject != nil, selectedTab == .chat {
+                        Button { showChatList = true } label: {
+                            Image(systemName: "list.bullet")
+                                .font(.title2)
+                        }
+                        .accessibilityLabel("Conversations")
+                        .accessibilityHint("Open conversation list")
+                    }
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    if selectedProject != nil {
+                        Menu {
+                            Button { triggerBuild() } label: {
+                                Label("Build & Install", systemImage: "hammer")
+                            }
+                            .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
+                            Button { triggerTestFlightUpload() } label: {
+                                Label("Upload to TestFlight", systemImage: "arrow.up.circle")
+                            }
+                            .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
+                        } label: {
+                            Group {
+                                if isBuilding || isUploadingTestFlight {
+                                    ProgressView().scaleEffect(1.0)
+                                } else {
+                                    Image(systemName: "hammer.circle")
+                                        .font(.title2)
+                                }
+                            }
+                            .frame(width: 36, height: 36)
+                        }
+                        .accessibilityLabel("Build")
+                    }
+                    Button { showConfig = true } label: {
+                        Image(systemName: "gearshape")
+                            .font(.title2)
+                    }
+                    .accessibilityLabel("Settings")
+                }
+            }
             .sheet(isPresented: $showChatList) {
                 if let project = selectedProject {
                     ChatListView(
@@ -111,69 +157,40 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private func toolbarButtonRow(project: ProjectEntry?) -> some View {
-        HStack(spacing: 0) {
-            if let project = project {
-                NavigationLink {
-                    FileBrowserView(projectPath: project.path, host: host, port: portInt)
-                } label: {
-                    ToolbarButtonContent(icon: "folder", title: "Files")
-                }
-                NavigationLink {
-                    GitView(projectPath: project.path, host: host, port: portInt)
-                } label: {
-                    ToolbarButtonContent(icon: "arrow.triangle.branch", title: "Git")
-                }
-                Button {
-                    showChatList = true
-                } label: {
-                    ToolbarButtonContent(icon: "list.bullet", title: "Chats")
-                }
-            }
-            if project != nil {
-                Button {
-                    triggerBuild()
-                } label: {
-                    if isBuilding {
-                        VStack(spacing: 4) {
-                            ProgressView()
-                                .scaleEffect(0.9)
-                            Text("Build")
-                                .font(.caption2)
-                        }
-                        .frame(maxWidth: .infinity)
-                    } else {
-                        ToolbarButtonContent(icon: "hammer", title: "Build")
-                    }
-                }
-                .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
-                Button {
-                    triggerTestFlightUpload()
-                } label: {
-                    if isUploadingTestFlight {
-                        VStack(spacing: 4) {
-                            ProgressView()
-                                .scaleEffect(0.9)
-                            Text("TestFlight")
-                                .font(.caption2)
-                        }
-                        .frame(maxWidth: .infinity)
-                    } else {
-                        ToolbarButtonContent(icon: "arrow.up.circle", title: "TestFlight")
-                    }
-                }
-                .disabled(isBuilding || isUploadingTestFlight || host.isEmpty)
-            }
-            Button {
-                showConfig = true
-            } label: {
-                ToolbarButtonContent(icon: "gearshape", title: "Settings")
-            }
+    private var navigationTitle: String {
+        guard let project = selectedProject else { return "CursorConnector" }
+        switch selectedTab {
+        case .chat:
+            return project.label ?? (project.path as NSString).lastPathComponent
+        case .files:
+            return "Files"
+        case .git:
+            return "Git"
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 10)
-        .foregroundStyle(.white)
+    }
+
+    @ViewBuilder
+    private func projectTabContent(project: ProjectEntry) -> some View {
+        TabView(selection: $selectedTab) {
+            ChatView(
+                project: project,
+                host: host,
+                port: portInt,
+                messages: $messages,
+                conversationId: $selectedConversationId,
+                conversationSummaries: $conversationSummaries
+            )
+            .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
+            .tag(ProjectTab.chat)
+
+            FileBrowserView(projectPath: project.path, host: host, port: portInt)
+                .tabItem { Label("Files", systemImage: "folder") }
+                .tag(ProjectTab.files)
+
+            GitView(projectPath: project.path, host: host, port: portInt)
+                .tabItem { Label("Git", systemImage: "arrow.triangle.branch") }
+                .tag(ProjectTab.git)
+        }
         .tint(.white)
     }
 
@@ -302,36 +319,38 @@ struct ContentView: View {
 
     private var emptyState: some View {
         ScrollView {
-            VStack(spacing: 24) {
+            VStack(spacing: 28) {
                 if !host.isEmpty {
                     recentProjectsSection
                 }
-                VStack(spacing: 20) {
-                    Image(systemName: "bubble.left.and.bubble.right")
-                        .font(.system(size: 56))
-                        .foregroundStyle(.secondary)
-                    Text("Connect to your Mac")
-                        .font(.title2)
-                        .fontWeight(.medium)
-                    Text("Open Settings to choose your Mac’s host and a project. Then you can chat with Cursor and browse files.")
-                        .font(.body)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 32)
-                    Button {
-                        showConfig = true
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .padding(.top, 8)
-                }
-                .frame(maxWidth: .infinity)
-                Spacer(minLength: 24)
+                connectCard
             }
-            .padding(.vertical, 20)
+            .padding(20)
+            .padding(.bottom, 32)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var connectCard: some View {
+        VStack(spacing: 20) {
+            Text("Connect to your Mac")
+                .font(.title2)
+                .fontWeight(.semibold)
+            Text("Open Settings to set your Mac’s host and pick a project. Then chat with Cursor, browse files, and manage Git from here.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 28)
+        .padding(.horizontal, 24)
+        .background(Color(white: 0.22))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -398,7 +417,6 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10))
             }
         }
-        .padding(.horizontal, 20)
     }
 }
 
@@ -486,23 +504,6 @@ private struct ChatListRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-}
-
-/// Toolbar button with icon above label for consistent sizing.
-private struct ToolbarButtonContent: View {
-    let icon: String
-    let title: String
-
-    var body: some View {
-        VStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 22))
-            Text(title)
-                .font(.caption2)
-                .lineLimit(1)
-        }
-        .frame(maxWidth: .infinity)
     }
 }
 

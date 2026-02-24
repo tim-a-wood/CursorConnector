@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 enum CompanionAPI {
     static let defaultPort: Int = 9283
@@ -112,7 +113,41 @@ enum CompanionAPI {
     /// Called by the app delegate when the system delivers background URLSession events. Set and cleared by UIApplicationDelegate.
     static var backgroundSessionCompletionHandler: (() -> Void)?
 
-    /// Streams agent output via Server-Sent Events. Uses a *background* URLSession so the transfer continues when the app is suspended (e.g. user switches apps on another network). Chunks are delivered in real time while in foreground; when returning from background we may receive buffered data and completion.
+    /// Sends the prompt via a background *download* task. iOS continues download tasks when the app is suspended, so the request is not cancelled if the user switches away. No streaming; the full response is delivered in onComplete when the download finishes (in foreground or after app returns from background).
+    static func sendPromptViaBackgroundDownload(
+        path: String,
+        prompt: String,
+        host: String,
+        port: Int = defaultPort,
+        imageBase64: [String]? = nil,
+        onComplete: @escaping (Result<PromptResponse, Error>) -> Void
+    ) {
+        guard let base = baseURL(host: host, port: port) else {
+            onComplete(.failure(URLError(.badURL)))
+            return
+        }
+        let url = base.appendingPathComponent("prompt")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = promptTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        do {
+            var body: [String: Any] = ["path": path, "prompt": prompt]
+            if let images = imageBase64, !images.isEmpty {
+                body["images"] = images
+            }
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            onComplete(.failure(error))
+            return
+        }
+        streamDelegate.setDownloadCompletion(onComplete)
+        let task = backgroundURLSession.downloadTask(with: request)
+        streamDelegate.downloadTask = task
+        task.resume()
+    }
+
+    /// Streams agent output via Server-Sent Events. Uses a background URLSession so the transfer continues when the app is suspended (e.g. user switches away or locks the device); the system runs the transfer and wakes the app when it completes.
     /// - Parameter imageBase64: Optional screenshot/image(s) as base64-encoded strings (e.g. PNG). The agent will receive file paths to these images in the project.
     static func sendPromptStream(
         path: String,
@@ -139,26 +174,28 @@ enum CompanionAPI {
         request.httpMethod = "POST"
         request.timeoutInterval = promptTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let bodyData: Data
         do {
             var body: [String: Any] = ["path": path, "prompt": prompt]
             if let images = imageBase64, !images.isEmpty {
                 body["images"] = images
             }
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            bodyData = try JSONSerialization.data(withJSONObject: body)
         } catch {
             onComplete(error)
             return
         }
+        request.httpBody = nil  // uploadTask sends body via from: parameter
         streamDelegate.setCallbacks(onChunk: onChunk, onThinkingChunk: onThinkingChunk, onComplete: onComplete)
-        let task = backgroundURLSession.dataTask(with: request)
+        // Background URLSession only supports upload/download tasks; dataTask is cancelled when app is suspended.
+        let task = backgroundURLSession.uploadTask(with: request, from: bodyData)
         streamDelegate.task = task
         task.resume()
     }
 
     static let backgroundSessionIdentifier = "com.cursorconnector.prompt-stream"
     private static let streamDelegate = StreamDelegate()
-    /// Foreground session so response body is delivered incrementally (continuous feedback). Background sessions buffer until completion.
-    /// Timeouts set so agent can think for many minutes and app can suspend without the client timing out (default 60s would fire too soon).
+    /// Foreground session (prompt streaming uses backgroundURLSession so suspend does not cancel the request).
     private static let foregroundURLSession: URLSession = {
         let config = URLSessionConfiguration.default
         let timeout: TimeInterval = 1500  // 25 min between data; survive long suspend or long agent think
@@ -494,12 +531,17 @@ private struct XcodeBuildRequest: Codable {
 
 // MARK: - Streaming delegate
 
-private class StreamDelegate: NSObject, URLSessionDataDelegate {
+private class StreamDelegate: NSObject, URLSessionDataDelegate, URLSessionDownloadDelegate {
     private var buffer = ""
     private var onChunk: ((String) -> Void)?
     private var onThinkingChunk: ((String) -> Void)?
     private var onComplete: ((Error?) -> Void)?
     weak var task: URLSessionDataTask?
+
+    private var onPromptDownloadComplete: ((Result<CompanionAPI.PromptResponse, Error>) -> Void)?
+    weak var downloadTask: URLSessionDownloadTask?
+    private var lastDownloadedPromptResponse: CompanionAPI.PromptResponse?
+    private var downloadTaskRejectedHTTPStatus: Int?
 
     func setCallbacks(onChunk: @escaping (String) -> Void, onThinkingChunk: ((String) -> Void)? = nil, onComplete: @escaping (Error?) -> Void) {
         self.onChunk = onChunk
@@ -507,10 +549,23 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
         self.onComplete = onComplete
     }
 
+    func setDownloadCompletion(_ completion: @escaping (Result<CompanionAPI.PromptResponse, Error>) -> Void) {
+        self.onPromptDownloadComplete = completion
+        self.lastDownloadedPromptResponse = nil
+        self.downloadTaskRejectedHTTPStatus = nil
+    }
+
     private func clearCallbacks() {
         onChunk = nil
         onThinkingChunk = nil
         onComplete = nil
+    }
+
+    private func clearDownloadCallbacks() {
+        onPromptDownloadComplete = nil
+        downloadTask = nil
+        lastDownloadedPromptResponse = nil
+        downloadTaskRejectedHTTPStatus = nil
     }
 
     private func processSSEEvent(_ eventBlock: String) {
@@ -543,6 +598,29 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        let isDownloadTask = task is URLSessionDownloadTask
+        if isDownloadTask {
+            let result: Result<CompanionAPI.PromptResponse, Error>
+            if let status = downloadTaskRejectedHTTPStatus {
+                result = .failure(NSError(domain: "CompanionAPI", code: status, userInfo: [NSLocalizedDescriptionKey: "HTTP \(status)"]))
+            } else if let err = error {
+                result = .failure(err)
+            } else if let response = lastDownloadedPromptResponse {
+                result = .success(response)
+            } else {
+                result = .failure(URLError(.unknown))
+            }
+            if let onPromptDownloadComplete = onPromptDownloadComplete {
+                DispatchQueue.main.async { onPromptDownloadComplete(result) }
+            }
+            let isBackgroundSession = session.configuration.identifier == CompanionAPI.backgroundSessionIdentifier
+            if isBackgroundSession {
+                let fromBackgroundSession = UIApplication.shared.applicationState != .active
+                AppDelegate.notifyAgentRequestComplete(error: error, fromBackgroundSession: fromBackgroundSession)
+            }
+            clearDownloadCallbacks()
+            return
+        }
         if !buffer.isEmpty {
             let lines = buffer.split(separator: "\n", omittingEmptySubsequences: false)
             var eventType: String?
@@ -561,6 +639,13 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
                     DispatchQueue.main.async { block(payload) }
                 }
             }
+        }
+        let isBackgroundSession = session.configuration.identifier == CompanionAPI.backgroundSessionIdentifier
+        if isBackgroundSession {
+            let fromBackgroundSession = UIApplication.shared.applicationState != .active
+            AppDelegate.notifyAgentRequestComplete(error: error, fromBackgroundSession: fromBackgroundSession)
+        } else {
+            AppDelegate.notifyAgentRequestComplete(error: error, fromBackgroundSession: false)
         }
         if let onComplete = onComplete {
             DispatchQueue.main.async { onComplete(error) }
@@ -588,10 +673,34 @@ private class StreamDelegate: NSObject, URLSessionDataDelegate {
         completionHandler(.allow)
     }
 
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        do {
+            let data = try Data(contentsOf: location)
+            if let decoded = try? JSONDecoder().decode(CompanionAPI.PromptResponse.self, from: data) {
+                lastDownloadedPromptResponse = decoded
+            }
+        } catch {
+            lastDownloadedPromptResponse = nil
+        }
+    }
+
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         DispatchQueue.main.async {
             CompanionAPI.backgroundSessionCompletionHandler?()
             CompanionAPI.backgroundSessionCompletionHandler = nil
         }
+    }
+}
+
+private extension StreamDelegate {
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            if let http = response as? HTTPURLResponse {
+                downloadTaskRejectedHTTPStatus = http.statusCode
+            }
+            completionHandler(.cancel)
+            return
+        }
+        completionHandler(.allow)
     }
 }
