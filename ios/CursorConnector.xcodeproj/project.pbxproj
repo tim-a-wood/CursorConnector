@@ -22,6 +22,8 @@
 		A1B10000000000000000000D /* GitView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B10000000000000000003D /* GitView.swift */; };
 		A1B10000000000000000000E /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B10000000000000000003E /* AppDelegate.swift */; };
 		A1B10000000000000000000F /* GitDiffView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B10000000000000000003F /* GitDiffView.swift */; };
+		A1B100000000000000000058 /* Conversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B100000000000000000042 /* Conversation.swift */; };
+		A1B100000000000000000059 /* ConversationStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B100000000000000000043 /* ConversationStore.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +34,7 @@
 		A1B100000000000000000014 /* CompanionAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionAPI.swift; sourceTree = "<group>"; };
 		A1B100000000000000000015 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A1B100000000000000000035 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A1B100000000000000000044 /* CursorConnector.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CursorConnector.entitlements; sourceTree = "<group>"; };
 		A1B100000000000000000036 /* OutputDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OutputDetailView.swift; sourceTree = "<group>"; };
 		A1B100000000000000000037 /* StructuredAgentOutputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StructuredAgentOutputView.swift; sourceTree = "<group>"; };
 		A1B100000000000000000038 /* FileBrowserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserView.swift; sourceTree = "<group>"; };
@@ -42,6 +45,8 @@
 		A1B10000000000000000003D /* GitView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitView.swift; sourceTree = "<group>"; };
 		A1B10000000000000000003E /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		A1B10000000000000000003F /* GitDiffView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitDiffView.swift; sourceTree = "<group>"; };
+		A1B100000000000000000042 /* Conversation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Conversation.swift; sourceTree = "<group>"; };
+		A1B100000000000000000043 /* ConversationStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationStore.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -71,6 +76,7 @@
 				A1B10000000000000000003F /* GitDiffView.swift */,
 				A1B100000000000000000015 /* Assets.xcassets */,
 				A1B100000000000000000035 /* Info.plist */,
+				A1B100000000000000000044 /* CursorConnector.entitlements */,
 			);
 			path = CursorConnector;
 			sourceTree = "<group>";
@@ -88,6 +94,7 @@
 			children = (
 				A1B100000000000000000013 /* ProjectEntry.swift */,
 				A1B10000000000000000003A /* ChatMessage.swift */,
+				A1B100000000000000000042 /* Conversation.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -96,6 +103,7 @@
 			isa = PBXGroup;
 			children = (
 				A1B100000000000000000014 /* CompanionAPI.swift */,
+				A1B100000000000000000043 /* ConversationStore.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -177,6 +185,8 @@
 				A1B10000000000000000000C /* ConfigView.swift in Sources */,
 				A1B10000000000000000000D /* GitView.swift in Sources */,
 				A1B10000000000000000000F /* GitDiffView.swift in Sources */,
+				A1B100000000000000000058 /* Conversation.swift in Sources */,
+				A1B100000000000000000059 /* ConversationStore.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -243,9 +253,11 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = CursorConnector/CursorConnector.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 11;
+				CURRENT_PROJECT_VERSION = 16;
 				DEVELOPMENT_ASSET_PATHS = "";
 				DEVELOPMENT_TEAM = Q6SAG88THN;
 				ENABLE_PREVIEWS = YES;
@@ -271,9 +283,11 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_ENTITLEMENTS = CursorConnector/CursorConnector.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Distribution";
+				"CODE_SIGN_IDENTITY[sdk=iphonesimulator*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 11;
+				CURRENT_PROJECT_VERSION = 16;
 				DEVELOPMENT_ASSET_PATHS = "";
 				DEVELOPMENT_TEAM = Q6SAG88THN;
 				ENABLE_PREVIEWS = YES;

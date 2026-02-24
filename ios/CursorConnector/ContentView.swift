@@ -5,6 +5,10 @@ struct ContentView: View {
     @AppStorage("cursorConnectorPort") private var port = "9283"
     @State private var selectedProject: ProjectEntry?
     @State private var messages: [ChatMessage] = []
+    /// When nil, current messages are an unsaved "new chat". When set, we're viewing/continuing that conversation.
+    @State private var selectedConversationId: UUID?
+    @State private var conversationSummaries: [ConversationSummary] = []
+    @State private var showChatList = false
     @State private var showConfig = false
     @State private var isBuilding = false
     @State private var isUploadingTestFlight = false
@@ -28,7 +32,14 @@ struct ContentView: View {
                 }
                 toolbarButtonRow(project: selectedProject)
                 if let project = selectedProject {
-                    ChatView(project: project, host: host, port: portInt, messages: $messages)
+                    ChatView(
+                        project: project,
+                        host: host,
+                        port: portInt,
+                        messages: $messages,
+                        conversationId: $selectedConversationId,
+                        conversationSummaries: $conversationSummaries
+                    )
                 } else {
                     emptyState
                 }
@@ -42,18 +53,44 @@ struct ContentView: View {
                 await fetchRecentProjects()
             }
             .onChange(of: selectedProject) { _, newValue in
-                if newValue != nil {
+                if let project = newValue {
                     recentProjects = []
                     recentProjectsError = nil
+                    selectedConversationId = nil
+                    messages = []
+                    conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
                 }
             }
             .navigationTitle(selectedProject != nil ? (selectedProject!.label ?? (selectedProject!.path as NSString).lastPathComponent) : "Cursor")
             .navigationBarTitleDisplayMode(.inline)
+            .sheet(isPresented: $showChatList) {
+                if let project = selectedProject {
+                    ChatListView(
+                        project: project,
+                        summaries: conversationSummaries,
+                        currentConversationId: selectedConversationId,
+                        onSelect: { id in
+                            selectedConversationId = id
+                            if let conv = ConversationStore.shared.loadConversation(projectPath: project.path, id: id) {
+                                messages = conv.messages
+                            }
+                            showChatList = false
+                        },
+                        onNewChat: {
+                            selectedConversationId = nil
+                            messages = []
+                            showChatList = false
+                        },
+                        onDismiss: { showChatList = false }
+                    )
+                }
+            }
             .sheet(isPresented: $showConfig) {
                 ConfigView(host: $host, port: $port, selectedProject: $selectedProject)
                     .onDisappear {
                         if selectedProject == nil {
                             messages = []
+                            selectedConversationId = nil
                         }
                     }
             }
@@ -87,6 +124,11 @@ struct ContentView: View {
                     GitView(projectPath: project.path, host: host, port: portInt)
                 } label: {
                     ToolbarButtonContent(icon: "arrow.triangle.branch", title: "Git")
+                }
+                Button {
+                    showChatList = true
+                } label: {
+                    ToolbarButtonContent(icon: "list.bullet", title: "Chats")
                 }
             }
             if project != nil {
@@ -176,7 +218,9 @@ struct ContentView: View {
     /// Opens a recent project: tells server to open in Cursor and selects it in the app.
     private func openRecentProject(_ project: ProjectEntry) {
         selectedProject = project
+        selectedConversationId = nil
         messages = []
+        conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
         Task {
             try? await CompanionAPI.openProject(path: project.path, host: host, port: portInt)
         }
@@ -355,6 +399,93 @@ struct ContentView: View {
             }
         }
         .padding(.horizontal, 20)
+    }
+}
+
+/// List of past chats for the current project; tap to open or start a new chat.
+private struct ChatListView: View {
+    let project: ProjectEntry
+    let summaries: [ConversationSummary]
+    let currentConversationId: UUID?
+    let onSelect: (UUID) -> Void
+    let onNewChat: () -> Void
+    let onDismiss: () -> Void
+
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .short
+        f.timeStyle = .short
+        return f
+    }()
+
+    var body: some View {
+        NavigationStack {
+            listContent
+                .navigationTitle("Chats")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { onDismiss() }
+                    }
+                }
+        }
+    }
+
+    private var listContent: some View {
+        List {
+            Section {
+                Button {
+                    onNewChat()
+                } label: {
+                    Label("New chat", systemImage: "plus.bubble")
+                }
+            }
+            if !summaries.isEmpty {
+                Section("Recent chats") {
+                    ForEach(summaries) { summary in
+                        ChatListRow(
+                            summary: summary,
+                            isSelected: summary.id == currentConversationId,
+                            dateFormatter: dateFormatter,
+                            onTap: { onSelect(summary.id) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct ChatListRow: View {
+    let summary: ConversationSummary
+    let isSelected: Bool
+    let dateFormatter: DateFormatter
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(summary.title)
+                        .font(.body)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                    Text(dateFormatter.string(from: summary.updatedAt))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                if isSelected {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.body)
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 

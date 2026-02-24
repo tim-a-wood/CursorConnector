@@ -1327,6 +1327,7 @@ func runXcodeArchive(projectPath: String) -> (archivePath: String?, output: Stri
         "-project", projectFile,
         "-scheme", xcodeSchemeName,
         "-configuration", "Release",
+        "-destination", "generic/platform=iOS",
         "-archivePath", archivePath,
         "-allowProvisioningUpdates",
         "archive"

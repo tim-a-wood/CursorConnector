@@ -10,6 +10,8 @@ struct ChatView: View {
     let port: Int
 
     @Binding var messages: [ChatMessage]
+    @Binding var conversationId: UUID?
+    @Binding var conversationSummaries: [ConversationSummary]
     @State private var inputText: String = ""
     @State private var sending = false
     @State private var sendError: String?
@@ -196,6 +198,13 @@ struct ChatView: View {
         sendError = nil
         inputFocused = false
 
+        // Create a new conversation if this is the first message in an unsaved chat.
+        if conversationId == nil {
+            let conv = ConversationStore.shared.createConversation(projectPath: project.path, messages: [])
+            conversationId = conv.id
+            conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
+        }
+
         let displayContent = text.isEmpty ? "Screenshot" : text
         let userMsg = ChatMessage(role: .user, content: displayContent, imageData: imageToSend)
         messages.append(userMsg)
@@ -210,13 +219,25 @@ struct ChatView: View {
 
         var hasStrippedPrompt = false
         var lastContentChunk = ""
-        let promptForAgent = text.isEmpty ? "See the attached screenshot(s) above." : text
-        let trimmedPrompt = promptForAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Include prior messages so the agent has context when continuing a chat.
+        let history = messages.dropLast(2)
+        let newUserContent = text.isEmpty ? "See the attached screenshot(s) above." : text
+        let promptForAgent: String
+        if history.isEmpty {
+            promptForAgent = newUserContent
+        } else {
+            let historyBlock = history.map { msg in
+                let label = msg.role == .user ? "User" : "Assistant"
+                return "\(label): \(msg.content)"
+            }.joined(separator: "\n\n")
+            promptForAgent = "Previous conversation:\n\n\(historyBlock)\n\nUser: \(newUserContent)"
+        }
+        let trimmedPrompt = newUserContent.trimmingCharacters(in: .whitespacesAndNewlines)
         let imageBase64: [String]? = imageToSend.map { [$0.base64EncodedString()] }
 
         CompanionAPI.sendPromptStream(
             path: project.path,
-            prompt: promptForAgent,
+            prompt: promptForAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "See the attached screenshot(s) above." : promptForAgent,
             host: host,
             port: port,
             imageBase64: imageBase64,
@@ -258,6 +279,7 @@ struct ChatView: View {
             onComplete: { error in
                 backgroundTask.end()
                 AppDelegate.notifyAgentRequestComplete(error: error)
+                let isCancelled = error.map { AppDelegate.isCancelledError($0) } ?? false
                 Task { @MainActor in
                     if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
                         var content = messages[idx].content
@@ -272,12 +294,18 @@ struct ChatView: View {
                             }
                         }
                         messages[idx].content = content
-                        if let err = error {
+                        if let err = error, !isCancelled {
                             messages[idx].content += "\n\nError: \(err.localizedDescription)"
                             sendError = err.localizedDescription
                         }
                     }
                     sending = false
+                    // Persist conversation so it can be revisited later.
+                    if let cid = conversationId {
+                        let title = Conversation.titleFromMessages(messages)
+                        ConversationStore.shared.updateConversation(projectPath: project.path, id: cid, messages: messages, title: title)
+                        conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
+                    }
                 }
             }
         )
@@ -430,7 +458,9 @@ private struct ImageDataTransfer: Transferable {
             messages: .constant([
                 ChatMessage(role: .user, content: "Hello"),
                 ChatMessage(role: .assistant, content: "Hi! How can I help?")
-            ])
+            ]),
+            conversationId: .constant(nil),
+            conversationSummaries: .constant([])
         )
     }
 }

@@ -155,7 +155,7 @@ enum CompanionAPI {
         task.resume()
     }
 
-    private static let backgroundSessionIdentifier = "com.cursorconnector.prompt-stream"
+    static let backgroundSessionIdentifier = "com.cursorconnector.prompt-stream"
     private static let streamDelegate = StreamDelegate()
     /// Foreground session so response body is delivered incrementally (continuous feedback). Background sessions buffer until completion.
     /// Timeouts set so agent can think for many minutes and app can suspend without the client timing out (default 60s would fire too soon).
@@ -171,6 +171,7 @@ enum CompanionAPI {
         config.timeoutIntervalForRequest = 1500   // 25 min between data so suspend doesn't cause timeout
         config.timeoutIntervalForResource = 1800   // 30 min total for full response
         config.waitsForConnectivity = true       // when app resumes, wait for network instead of failing
+        config.isDiscretionary = false           // run transfer immediately; don’t defer (e.g. on Wi‑Fi only)
         return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
     }()
 
