@@ -92,6 +92,16 @@ The Companion prevents **system** idle sleep so the Mac stays reachable, but all
 - **System Settings → Lock Screen** (or **Battery**): enable **“Prevent automatic sleeping when the display is off”** (or the equivalent on your macOS version). The display can still turn off; the Mac stays awake so the iOS app can reconnect.
 - The iOS app will show “Mac unreachable. Reconnecting…” and retry every few seconds; when the Mac is reachable again (e.g. after you wake it), it reconnects automatically.
 
+### MacBook lid closed (Companion still reachable)
+
+Closing the lid normally puts the Mac to sleep, so the Companion stops and the iOS app can’t connect. The Companion cannot override lid-close sleep. Options:
+
+1. **Clamshell mode** — Plug in an **external display**, **keyboard**, and **power**. Close the lid. The Mac stays awake and the Companion keeps running. (Same network or Tailscale so the iPhone can reach the Mac’s IP.)
+2. **Prevent sleep when on power (may work on some Macs)** — In Terminal:  
+   `sudo pmset -c sleep 0` (never sleep when plugged in).  
+   On some MacBooks the lid still forces sleep; if so, use clamshell mode.
+3. **Run the Companion on another machine** — Use a Mac mini, desktop Mac, or a cloud VM that’s always on. Run `cd Companion && swift run` there and point the iOS app at that host (e.g. Tailscale IP or tunnel).
+
 ### Build button (install to iPhone)
 
 The **Build** button in the app triggers a build on the Mac and installs to a connected device. Xcode only sees devices that are **connected by USB** or on the **same Wi‑Fi** (with wireless debugging). If you use Tailscale (or another network) to reach the Mac, the app can chat and browse files, but Build will fail with "No iOS device visible to Xcode" — Tailscale does not make the iPhone visible to Xcode. To use Build: connect the iPhone to the Mac with a cable, or be on the same Wi‑Fi and use wireless debugging. To get new builds when away from the Mac, use TestFlight (see below).
