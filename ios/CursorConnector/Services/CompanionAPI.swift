@@ -187,15 +187,15 @@ enum CompanionAPI {
         }
         request.httpBody = nil  // uploadTask sends body via from: parameter
         streamDelegate.setCallbacks(onChunk: onChunk, onThinkingChunk: onThinkingChunk, onComplete: onComplete)
-        // Background URLSession only supports upload/download tasks; dataTask is cancelled when app is suspended.
-        let task = backgroundURLSession.uploadTask(with: request, from: bodyData)
+        // Use foreground session so delegate callbacks (didReceive data) are delivered incrementally while the app is in foreground, fixing real-time thinking/content display. Background session can buffer until completion and make the chat appear to hang.
+        let task = foregroundURLSession.uploadTask(with: request, from: bodyData)
         streamDelegate.task = task
         task.resume()
     }
 
     static let backgroundSessionIdentifier = "com.cursorconnector.prompt-stream"
     private static let streamDelegate = StreamDelegate()
-    /// Foreground session (prompt streaming uses backgroundURLSession so suspend does not cancel the request).
+    /// Foreground session used for prompt streaming so data/thinking arrive incrementally; background session can buffer and make the UI appear to hang.
     private static let foregroundURLSession: URLSession = {
         let config = URLSessionConfiguration.default
         let timeout: TimeInterval = 1500  // 25 min between data; survive long suspend or long agent think

@@ -206,15 +206,18 @@ struct ChatView: View {
                 .layoutPriority(1)
 
             Button {
-                sendMessage()
+                if canSend {
+                    sendMessage()
+                } else {
+                    inputFocused = true
+                }
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(canSend ? Color.accentColor : Color(.tertiaryLabel))
             }
             .frame(width: 36, height: 36)
-            .disabled(!canSend)
-            .accessibilityLabel("Send")
+            .accessibilityLabel(canSend ? "Send" : "Type a message to enable send")
         }
         .background(Color(.tertiarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 22))
@@ -224,82 +227,106 @@ struct ChatView: View {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let imageToSend = attachedImage
         guard !text.isEmpty || imageToSend != nil else { return }
+
+        // Update UI immediately so the user sees their message and "Working on it..." (avoids freezing).
         inputText = ""
         attachedImage = nil
         selectedPhotoItem = nil
         sendError = nil
         inputFocused = false
 
-        // Create a new conversation if this is the first message in an unsaved chat.
-        if conversationId == nil {
-            let conv = ConversationStore.shared.createConversation(projectPath: project.path, messages: [])
-            conversationId = conv.id
-            conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
-        }
-
         let displayContent = text.isEmpty ? "Screenshot" : text
         let userMsg = ChatMessage(role: .user, content: displayContent, imageData: imageToSend)
         messages.append(userMsg)
 
-        sending = true
         let assistantMsgId = UUID()
         messages.append(ChatMessage(id: assistantMsgId, role: .assistant, content: ""))
-        var currentAssistantMsgId = assistantMsgId
+        sending = true
+
+        let path = project.path
+        let currentMessages = messages
+        let needNewConversation = conversationId == nil
+        let newUserContent = text.isEmpty ? "See the attached screenshot(s) above." : text
+        let history = currentMessages.dropLast(2)
+        let promptForAgent: String = history.isEmpty
+            ? newUserContent
+            : "Previous conversation:\n\n\(history.map { msg in "\(msg.role == .user ? "User" : "Assistant"): \(msg.content)" }.joined(separator: "\n\n"))\n\nUser: \(newUserContent)"
 
         let backgroundTask = BackgroundTaskHolder()
         backgroundTask.begin()
 
-        // Include prior messages so the agent has context when continuing a chat.
-        let history = messages.dropLast(2)
-        let newUserContent = text.isEmpty ? "See the attached screenshot(s) above." : text
-        let promptForAgent: String
-        if history.isEmpty {
-            promptForAgent = newUserContent
-        } else {
-            let historyBlock = history.map { msg in
-                let label = msg.role == .user ? "User" : "Assistant"
-                return "\(label): \(msg.content)"
-            }.joined(separator: "\n\n")
-            promptForAgent = "Previous conversation:\n\n\(historyBlock)\n\nUser: \(newUserContent)"
-        }
-        let imageBase64: [String]? = imageToSend.map { [$0.base64EncodedString()] }
+        // Do heavy work off the main thread (base64 encoding, file I/O) so the UI stays responsive.
+        Task {
+            if needNewConversation {
+                let conv = ConversationStore.shared.createConversation(projectPath: path, messages: currentMessages)
+                let summaries = ConversationStore.shared.loadConversationSummaries(projectPath: path)
+                await MainActor.run {
+                    conversationId = conv.id
+                    conversationSummaries = summaries
+                }
+            }
+            let imageBase64: [String]? = if let img = imageToSend {
+                await Task.detached(priority: .userInitiated) { [img] in
+                    [img.base64EncodedString()]
+                }.value
+            } else {
+                nil
+            }
 
-        // Use streaming so we get live thinking and response text; background URLSession upload task continues when app is suspended.
+            await MainActor.run {
+                startStream(
+                    path: path,
+                    promptForAgent: promptForAgent,
+                    imageBase64: imageBase64,
+                    assistantMsgId: assistantMsgId,
+                    backgroundTask: backgroundTask
+                )
+            }
+        }
+    }
+
+    private func startStream(
+        path: String,
+        promptForAgent: String,
+        imageBase64: [String]?,
+        assistantMsgId: UUID,
+        backgroundTask: BackgroundTaskHolder
+    ) {
+        let throttle = StreamUpdateThrottle(flushInterval: 0.04) { [self] contentDelta, thinkingDelta in
+            Task { @MainActor in
+                var copy = messages
+                if let idx = copy.firstIndex(where: { $0.id == assistantMsgId }) {
+                    if !contentDelta.isEmpty { copy[idx].content += contentDelta }
+                    if !thinkingDelta.isEmpty { copy[idx].thinking += thinkingDelta }
+                }
+                messages = copy
+                streamChunkNotifier.bump()
+            }
+        }
+
         CompanionAPI.sendPromptStream(
-            path: project.path,
+            path: path,
             prompt: promptForAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "See the attached screenshot(s) above." : promptForAgent,
             host: host,
             port: port,
             imageBase64: imageBase64,
             streamThinking: true,
-            onChunk: { [messages, streamChunkNotifier] chunk in
-                Task { @MainActor in
-                    if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
-                        self.messages[idx].content += chunk
-                    }
-                    streamChunkNotifier.bump()
-                }
-            },
-            onThinkingChunk: { [messages, streamChunkNotifier] chunk in
-                Task { @MainActor in
-                    if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
-                        self.messages[idx].thinking += chunk
-                    }
-                    streamChunkNotifier.bump()
-                }
-            },
+            onChunk: { throttle.appendContent($0) },
+            onThinkingChunk: { throttle.appendThinking($0) },
             onComplete: { error in
+                throttle.flushImmediately()
                 backgroundTask.end()
                 Task { @MainActor in
-                    if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
+                    var copy = messages
+                    if let idx = copy.firstIndex(where: { $0.id == assistantMsgId }) {
                         if let err = error {
                             let isCancelled = AppDelegate.isCancelledError(err)
                             if !isCancelled {
-                                messages[idx].content += "\n\nError: \(err.localizedDescription)"
+                                copy[idx].content += "\n\nError: \(err.localizedDescription)"
                                 sendError = err.localizedDescription
                             }
                         } else {
-                            var content = messages[idx].content
+                            var content = copy[idx].content
                             if let r = content.range(of: "\n[exit: ") {
                                 content = String(content[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                             }
@@ -309,9 +336,10 @@ struct ChatView: View {
                                     break
                                 }
                             }
-                            messages[idx].content = content
+                            copy[idx].content = content
                         }
                     }
+                    messages = copy
                     sending = false
                     if let cid = conversationId {
                         let title = Conversation.titleFromMessages(messages)
@@ -321,6 +349,70 @@ struct ChatView: View {
                 }
             }
         )
+    }
+}
+
+/// Notifier used to trigger scroll-to-bottom when stream chunks arrive (ObservableObject so closures can bump it).
+private final class StreamChunkNotifier: ObservableObject {
+    @Published var tick: Int = 0
+    func bump() {
+        tick += 1
+    }
+}
+
+/// Batches stream chunks and applies them to the message at a fixed interval to avoid freezing the UI.
+private final class StreamUpdateThrottle {
+    private var pendingContent = ""
+    private var pendingThinking = ""
+    private let flushInterval: TimeInterval
+    private let applyCallback: (String, String) -> Void
+    private var scheduledWorkItem: DispatchWorkItem?
+
+    init(flushInterval: TimeInterval = 0.06, applyCallback: @escaping (String, String) -> Void) {
+        self.flushInterval = flushInterval
+        self.applyCallback = applyCallback
+    }
+
+    func appendContent(_ chunk: String) {
+        pendingContent += chunk
+        scheduleFlushIfNeeded()
+    }
+
+    func appendThinking(_ chunk: String) {
+        pendingThinking += chunk
+        scheduleFlushIfNeeded()
+    }
+
+    private func scheduleFlushIfNeeded() {
+        guard scheduledWorkItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            self?.flush()
+        }
+        scheduledWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + flushInterval, execute: item)
+    }
+
+    private func flush() {
+        scheduledWorkItem = nil
+        let c = pendingContent
+        let t = pendingThinking
+        pendingContent = ""
+        pendingThinking = ""
+        if !c.isEmpty || !t.isEmpty {
+            applyCallback(c, t)
+        }
+    }
+
+    func flushImmediately() {
+        scheduledWorkItem?.cancel()
+        scheduledWorkItem = nil
+        let c = pendingContent
+        let t = pendingThinking
+        pendingContent = ""
+        pendingThinking = ""
+        if !c.isEmpty || !t.isEmpty {
+            applyCallback(c, t)
+        }
     }
 }
 
@@ -386,16 +478,7 @@ struct ChatBubbleView: View {
                                     .font(.caption)
                                     .fontWeight(.medium)
                                     .foregroundStyle(.secondary)
-                                if message.thinking.isEmpty {
-                                    HStack(spacing: 6) {
-                                        ProgressView()
-                                            .scaleEffect(0.8)
-                                        Text("Working on it…")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                } else {
+                                if !message.thinking.isEmpty {
                                     ParagraphFormattedText(
                                         text: message.thinking,
                                         font: .caption,
@@ -404,6 +487,27 @@ struct ChatBubbleView: View {
                                         lineSpacing: 4
                                     )
                                     .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                } else if isStreaming, !message.content.isEmpty {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text("Response in progress…")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                        Text(String(message.content.prefix(400)))
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(8)
+                                            .textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                } else {
+                                    HStack(spacing: 6) {
+                                        ProgressView()
+                                            .scaleEffect(0.8)
+                                        Text("Working on it…")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
