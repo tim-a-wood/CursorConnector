@@ -15,5 +15,10 @@ let package = Package(
             ],
             path: "Sources"
         ),
+        .testTarget(
+            name: "CompanionTests",
+            dependencies: ["Companion"],
+            path: "Tests/CompanionTests"
+        ),
     ]
 )

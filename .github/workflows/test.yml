@@ -47,7 +47,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             -quiet
         working-directory: ${{ github.workspace }}
-        continue-on-error: true  # Set to false once an iOS test target is added
+        continue-on-error: true  # Simulator can be flaky in CI; set false to fail the job when iOS tests fail
 
       - name: Upload test results (optional)
         if: always()

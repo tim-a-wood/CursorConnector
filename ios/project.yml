@@ -24,3 +24,32 @@ targets:
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
           UISceneConfigurations: {}
+  CursorConnectorTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - CursorConnectorTests
+    dependencies:
+      - target: CursorConnector
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cursorconnector.app.CursorConnectorTests
+schemes:
+  CursorConnector:
+    build:
+      targets:
+        CursorConnector: all
+        CursorConnectorTests: [testing]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - name: CursorConnectorTests
+          parallelizable: true
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
