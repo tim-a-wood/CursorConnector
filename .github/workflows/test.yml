@@ -39,6 +39,7 @@ jobs:
 
       - name: iOS – run tests
         run: |
+          rm -rf TestResults.xcresult
           xcodebuild test \
             -project ios/CursorConnector.xcodeproj \
             -scheme CursorConnector \
