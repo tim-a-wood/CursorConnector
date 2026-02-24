@@ -36,6 +36,8 @@
 		<key>UISceneConfigurations</key>
 		<dict/>
 	</dict>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Cursor Connector needs access to your photos to send screenshots to the agent so it can see what's on your screen.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

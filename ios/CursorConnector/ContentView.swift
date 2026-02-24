@@ -13,6 +13,10 @@ struct ContentView: View {
     @State private var showBuildAlert = false
     /// When we have a project, periodically check /health. If unreachable (e.g. Mac slept), show banner and retry until back.
     @State private var serverReachable: Bool = true
+    /// Recent projects from server (when no project selected). Shown on open so user can open without going to Settings.
+    @State private var recentProjects: [ProjectEntry] = []
+    @State private var loadingRecentProjects = false
+    @State private var recentProjectsError: String?
 
     private var portInt: Int { Int(port) ?? CompanionAPI.defaultPort }
 
@@ -33,6 +37,16 @@ struct ContentView: View {
             .task(id: "\(host):\(portInt):\(selectedProject?.path ?? "")") {
                 await connectionMonitorLoop()
             }
+            .task(id: "recent-\(host):\(portInt)-\(selectedProject?.path ?? "none")") {
+                guard selectedProject == nil, !host.isEmpty else { return }
+                await fetchRecentProjects()
+            }
+            .onChange(of: selectedProject) { _, newValue in
+                if newValue != nil {
+                    recentProjects = []
+                    recentProjectsError = nil
+                }
+            }
             .navigationTitle(selectedProject != nil ? (selectedProject!.label ?? (selectedProject!.path as NSString).lastPathComponent) : "Cursor")
             .navigationBarTitleDisplayMode(.inline)
             .sheet(isPresented: $showConfig) {
@@ -44,6 +58,13 @@ struct ContentView: View {
                     }
             }
             .alert(buildAlertTitle, isPresented: $showBuildAlert) {
+                if buildAlertMessage != nil {
+                    Button("Copy") {
+                        if let msg = buildAlertMessage {
+                            UIPasteboard.general.string = msg
+                        }
+                    }
+                }
                 Button("OK", role: .cancel) {}
             } message: {
                 if let msg = buildAlertMessage {
@@ -129,6 +150,40 @@ struct ContentView: View {
 
     /// Polls /health. When unreachable, sets serverReachable = false and retries every 5s until reachable again.
     /// Shorter interval when reachable keeps traffic flowing so the Mac’s network is less likely to drop when display sleeps.
+    /// Fetches recent projects from server when no project is selected (for empty-state "Recent" list).
+    private func fetchRecentProjects() async {
+        guard selectedProject == nil, !host.isEmpty else { return }
+        await MainActor.run { loadingRecentProjects = true; recentProjectsError = nil }
+        defer { Task { @MainActor in loadingRecentProjects = false } }
+        do {
+            let list = try await CompanionAPI.fetchProjects(host: host, port: portInt)
+            await MainActor.run {
+                if selectedProject == nil {
+                    recentProjects = list
+                    recentProjectsError = nil
+                }
+            }
+        } catch {
+            await MainActor.run {
+                if selectedProject == nil {
+                    recentProjects = []
+                    recentProjectsError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    /// Opens a recent project: tells server to open in Cursor and selects it in the app.
+    private func openRecentProject(_ project: ProjectEntry) {
+        selectedProject = project
+        messages = []
+        Task {
+            try? await CompanionAPI.openProject(path: project.path, host: host, port: portInt)
+        }
+    }
+
+    /// Polls /health. When unreachable, sets serverReachable = false and retries every 5s until reachable again.
+    /// Shorter interval when reachable keeps traffic flowing so the Mac's network is less likely to drop when display sleeps.
     private func connectionMonitorLoop() async {
         guard !host.isEmpty else { return }
         let intervalReachable: UInt64 = 12_000_000_000   // 12s when connected (keeps connection active)
@@ -202,29 +257,104 @@ struct ContentView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 20) {
-            Spacer()
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text("Connect to your Mac")
-                .font(.title2)
-                .fontWeight(.medium)
-            Text("Open Settings to choose your Mac’s host and a project. Then you can chat with Cursor and browse files.")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-            Button {
-                showConfig = true
-            } label: {
-                Label("Settings", systemImage: "gearshape")
+        ScrollView {
+            VStack(spacing: 24) {
+                if !host.isEmpty {
+                    recentProjectsSection
+                }
+                VStack(spacing: 20) {
+                    Image(systemName: "bubble.left.and.bubble.right")
+                        .font(.system(size: 56))
+                        .foregroundStyle(.secondary)
+                    Text("Connect to your Mac")
+                        .font(.title2)
+                        .fontWeight(.medium)
+                    Text("Open Settings to choose your Mac’s host and a project. Then you can chat with Cursor and browse files.")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                    Button {
+                        showConfig = true
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .padding(.top, 8)
+                }
+                .frame(maxWidth: .infinity)
+                Spacer(minLength: 24)
             }
-            .buttonStyle(.borderedProminent)
-            .padding(.top, 8)
-            Spacer()
+            .padding(.vertical, 20)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var recentProjectsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Recent")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            if loadingRecentProjects {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .scaleEffect(0.9)
+                    Text("Loading projects…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+            } else if let err = recentProjectsError {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if recentProjects.isEmpty {
+                Text("No recent projects. Add host in Settings and tap Refresh, or add ~/.cursor-connector-projects.json on your Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(recentProjects) { project in
+                        Button {
+                            openRecentProject(project)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "folder.fill")
+                                    .font(.body)
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 24, alignment: .center)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(project.label ?? (project.path as NSString).lastPathComponent)
+                                        .font(.body)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    Text(project.path)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer(minLength: 8)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .padding(.vertical, 10)
+                            .padding(.horizontal, 12)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .background(Color(white: 0.22))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+        }
+        .padding(.horizontal, 20)
     }
 }
 

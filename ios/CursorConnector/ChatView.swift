@@ -1,5 +1,7 @@
 import SwiftUI
 import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
 
 /// Chat-style conversation with message bubbles and an input bar at the bottom.
 struct ChatView: View {
@@ -14,9 +16,12 @@ struct ChatView: View {
     @FocusState private var inputFocused: Bool
     /// Incremented on each stream chunk so we keep scrolling to bottom while responding.
     @State private var scrollTrigger: Int = 0
+    @State private var attachedImage: Data? = nil
+    @State private var selectedPhotoItem: PhotosPickerItem? = nil
 
     private var canSend: Bool {
-        !sending && !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasText = !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return !sending && (hasText || attachedImage != nil)
     }
 
     var body: some View {
@@ -103,6 +108,29 @@ struct ChatView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
             }
+            if let imageData = attachedImage, let uiImage = UIImage(data: imageData) {
+                HStack(spacing: 8) {
+                    Image(uiImage: uiImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 44, height: 44)
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    Text("Screenshot attached")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        attachedImage = nil
+                        selectedPhotoItem = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.top, 6)
+            }
             HStack(alignment: .center, spacing: 10) {
                 TextField("Message Cursor…", text: $inputText, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -111,6 +139,28 @@ struct ChatView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 20))
                     .lineLimit(1...6)
                     .focused($inputFocused)
+
+                PhotosPicker(
+                    selection: $selectedPhotoItem,
+                    matching: .images,
+                    photoLibrary: .shared()
+                ) {
+                    Image(systemName: "camera.fill")
+                        .font(.system(size: 24))
+                        .foregroundStyle(.white)
+                }
+                .onChange(of: selectedPhotoItem) { _, newItem in
+                    Task {
+                        guard let newItem = newItem else {
+                            attachedImage = nil
+                            return
+                        }
+                        if let loaded = try? await newItem.loadTransferable(type: ImageDataTransfer.self) {
+                            attachedImage = loaded.data
+                        }
+                    }
+                }
+                .accessibilityLabel("Attach screenshot or photo")
 
                 Button {
                     inputFocused.toggle()
@@ -138,12 +188,16 @@ struct ChatView: View {
 
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let imageToSend = attachedImage
+        guard !text.isEmpty || imageToSend != nil else { return }
         inputText = ""
+        attachedImage = nil
+        selectedPhotoItem = nil
         sendError = nil
         inputFocused = false
 
-        let userMsg = ChatMessage(role: .user, content: text)
+        let displayContent = text.isEmpty ? "Screenshot" : text
+        let userMsg = ChatMessage(role: .user, content: displayContent, imageData: imageToSend)
         messages.append(userMsg)
 
         sending = true
@@ -156,24 +210,22 @@ struct ChatView: View {
 
         var hasStrippedPrompt = false
         var lastContentChunk = ""
-        let trimmedPrompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let promptForAgent = text.isEmpty ? "See the attached screenshot(s) above." : text
+        let trimmedPrompt = promptForAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let imageBase64: [String]? = imageToSend.map { [$0.base64EncodedString()] }
 
         CompanionAPI.sendPromptStream(
             path: project.path,
-            prompt: text,
+            prompt: promptForAgent,
             host: host,
             port: port,
+            imageBase64: imageBase64,
             streamThinking: true,
             onChunk: { chunk in
                 Task { @MainActor in
                     if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
                         if chunk == lastContentChunk { return }
                         lastContentChunk = chunk
-                        let content = messages[idx].content
-                        if !content.isEmpty && !content.hasSuffix(" ") && !content.hasSuffix("\n"),
-                           !chunk.isEmpty && !chunk.hasPrefix(" ") && !chunk.hasPrefix("\n") {
-                            messages[idx].content += " "
-                        }
                         messages[idx].content += chunk
                         if !hasStrippedPrompt, !trimmedPrompt.isEmpty {
                             let trimmedContent = messages[idx].content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -272,8 +324,20 @@ struct ChatBubbleView: View {
             }
             Group {
                 if isUser {
-                    Text(message.content)
-                        .textSelection(.enabled)
+                    VStack(alignment: .trailing, spacing: 8) {
+                        if let imageData = message.imageData,
+                           let uiImage = UIImage(data: imageData) {
+                            Image(uiImage: uiImage)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxWidth: 220, maxHeight: 220)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                        }
+                        if !message.content.isEmpty {
+                            Text(message.content)
+                                .textSelection(.enabled)
+                        }
+                    }
                 } else {
                     VStack(alignment: .leading, spacing: 12) {
                         if showThinkingSection {
@@ -343,6 +407,16 @@ private struct ParagraphFormattedText: View {
                     .foregroundStyle(color)
                     .lineSpacing(lineSpacing)
             }
+        }
+    }
+}
+
+/// Wrapper so we can load image data from PhotosPickerItem.
+private struct ImageDataTransfer: Transferable {
+    let data: Data
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(importedContentType: .image) { data in
+            ImageDataTransfer(data: data)
         }
     }
 }

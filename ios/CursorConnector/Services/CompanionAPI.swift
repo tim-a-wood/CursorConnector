@@ -2,8 +2,8 @@ import Foundation
 
 enum CompanionAPI {
     static let defaultPort: Int = 9283
-    /// Agent can run up to 5 min on the server; use 10 min so suspend + resume doesn't cause spurious timeouts.
-    static let promptTimeout: TimeInterval = 600
+    /// Agent can run up to 20 min on the server; use 25 min so suspend + resume and long runs don't cause spurious timeouts.
+    static let promptTimeout: TimeInterval = 1500
     /// Timeout for file and other short requests. Generous so brief app suspend doesn’t cause spurious timeouts.
     static let fileRequestTimeout: TimeInterval = 240
 
@@ -113,11 +113,13 @@ enum CompanionAPI {
     static var backgroundSessionCompletionHandler: (() -> Void)?
 
     /// Streams agent output via Server-Sent Events. Uses a *background* URLSession so the transfer continues when the app is suspended (e.g. user switches apps on another network). Chunks are delivered in real time while in foreground; when returning from background we may receive buffered data and completion.
+    /// - Parameter imageBase64: Optional screenshot/image(s) as base64-encoded strings (e.g. PNG). The agent will receive file paths to these images in the project.
     static func sendPromptStream(
         path: String,
         prompt: String,
         host: String,
         port: Int = defaultPort,
+        imageBase64: [String]? = nil,
         streamThinking: Bool = true,
         onChunk: @escaping (String) -> Void,
         onThinkingChunk: ((String) -> Void)? = nil,
@@ -138,7 +140,11 @@ enum CompanionAPI {
         request.timeoutInterval = promptTimeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         do {
-            request.httpBody = try JSONEncoder().encode(["path": path, "prompt": prompt])
+            var body: [String: Any] = ["path": path, "prompt": prompt]
+            if let images = imageBase64, !images.isEmpty {
+                body["images"] = images
+            }
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
         } catch {
             onComplete(error)
             return
@@ -155,15 +161,15 @@ enum CompanionAPI {
     /// Timeouts set so agent can think for many minutes and app can suspend without the client timing out (default 60s would fire too soon).
     private static let foregroundURLSession: URLSession = {
         let config = URLSessionConfiguration.default
-        let timeout: TimeInterval = 600  // 10 min between data; survive long suspend or long agent think
+        let timeout: TimeInterval = 1500  // 25 min between data; survive long suspend or long agent think
         config.timeoutIntervalForRequest = timeout
-        config.timeoutIntervalForResource = timeout + 120
+        config.timeoutIntervalForResource = timeout + 300  // 30 min total for full response
         return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
     }()
     private static let backgroundURLSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: backgroundSessionIdentifier)
-        config.timeoutIntervalForRequest = 600   // 10 min between data so suspend doesn't cause timeout
-        config.timeoutIntervalForResource = 720  // 12 min total for full response
+        config.timeoutIntervalForRequest = 1500   // 25 min between data so suspend doesn't cause timeout
+        config.timeoutIntervalForResource = 1800   // 30 min total for full response
         config.waitsForConnectivity = true       // when app resumes, wait for network instead of failing
         return URLSession(configuration: config, delegate: streamDelegate, delegateQueue: nil)
     }()

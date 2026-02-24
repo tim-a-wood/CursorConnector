@@ -87,6 +87,8 @@ func openProject(path: String) -> Bool {
 struct PromptRequest: Codable {
     var path: String
     var prompt: String
+    /// Optional screenshot(s) as base64-encoded image data. Saved under project's .cursor/connector-screenshots/ and paths are prepended to the prompt so the agent can see them.
+    var images: [String]?
 }
 
 struct PromptResponse: Codable {
@@ -94,7 +96,30 @@ struct PromptResponse: Codable {
     var exitCode: Int
 }
 
-let agentTimeoutSeconds: TimeInterval = 300
+/// If `images` (base64) are provided, writes them under projectPath/.cursor/connector-screenshots/ and returns a prompt that includes the file paths so the agent can view the screenshots. Otherwise returns the original prompt.
+private func promptWithSavedScreenshots(projectPath: String, prompt: String, images: [String]?) -> String {
+    guard let images = images, !images.isEmpty else { return prompt }
+    let screenshotsDir = (projectPath as NSString).appendingPathComponent(".cursor/connector-screenshots")
+    var isDir: ObjCBool = false
+    if !FileManager.default.fileExists(atPath: screenshotsDir, isDirectory: &isDir) || !isDir.boolValue {
+        try? FileManager.default.createDirectory(atPath: screenshotsDir, withIntermediateDirectories: true)
+    }
+    var paths: [String] = []
+    for base64 in images {
+        guard let data = Data(base64Encoded: base64), !data.isEmpty else { continue }
+        let name = "screenshot-\(UUID().uuidString).png"
+        let filePath = (screenshotsDir as NSString).appendingPathComponent(name)
+        guard (try? data.write(to: URL(fileURLWithPath: filePath))) != nil else { continue }
+        paths.append(filePath)
+    }
+    guard !paths.isEmpty else { return prompt }
+    let pathList = paths.map { "- \($0)" }.joined(separator: "\n")
+    let header = "The user attached the following screenshot(s). You can view them at:\n\(pathList)\n\n"
+    return header + (prompt.isEmpty ? "See the attached screenshot(s) above." : prompt)
+}
+
+/// Long agent runs (multi-step tasks, large codebases) can exceed 5 min. Use 20 min so requests don't time out under normal use.
+let agentTimeoutSeconds: TimeInterval = 1200
 let agentMaxOutputBytes = 1_000_000
 
 /// Prefer full path so we don't rely on PATH (e.g. when Companion is launched by Cursor/background).
@@ -742,7 +767,8 @@ server.POST["/prompt"] = { request in
           let decoded = try? JSONDecoder().decode(PromptRequest.self, from: Data(body)) else {
         return .badRequest(.text("Missing or invalid JSON body with 'path' and 'prompt'"))
     }
-    guard let result = runAgentPrompt(path: decoded.path, prompt: decoded.prompt) else {
+    let prompt = promptWithSavedScreenshots(projectPath: decoded.path, prompt: decoded.prompt, images: decoded.images)
+    guard let result = runAgentPrompt(path: decoded.path, prompt: prompt) else {
         return .badRequest(.text("Invalid path or empty prompt"))
     }
     var output = result.output
@@ -761,7 +787,7 @@ server.POST["/prompt-stream"] = { request in
         return .badRequest(.text("Missing or invalid JSON body with 'path' and 'prompt'"))
     }
     let path = decoded.path
-    let prompt = decoded.prompt
+    let prompt = promptWithSavedScreenshots(projectPath: decoded.path, prompt: decoded.prompt, images: decoded.images)
     let streamJSON = request.queryParams.first(where: { $0.0 == "stream" })?.1 == "json"
     let headers: [String: String] = [
         "Content-Type": "text/event-stream",
