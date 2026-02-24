@@ -59,15 +59,12 @@ struct ContentView: View {
                     conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
                 }
             }
+            .navigationTitle(selectedProject != nil ? navigationTitle : "Cursor")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarBackground(.bar, for: .navigationBar)
+            .toolbarBackground(Color(white: 0.12), for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbar {
-                ToolbarItem(placement: .principal) {
-                    Text(navigationTitle)
-                        .font(.headline)
-                }
                 ToolbarItem(placement: .topBarLeading) {
                     if selectedProject != nil, selectedTab == .chat {
                         Button { showChatList = true } label: {
@@ -341,6 +338,13 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
+            Button {
+                showConfig = true
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)

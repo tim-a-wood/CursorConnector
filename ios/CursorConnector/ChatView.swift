@@ -16,8 +16,8 @@ struct ChatView: View {
     @State private var sending = false
     @State private var sendError: String?
     @FocusState private var inputFocused: Bool
-    /// Incremented on each stream chunk so we keep scrolling to bottom while responding.
-    @State private var scrollTrigger: Int = 0
+    /// Bumped on each stream chunk so we keep scrolling to bottom while responding.
+    @StateObject private var streamChunkNotifier = StreamChunkNotifier()
     @State private var attachedImage: Data? = nil
     @State private var selectedPhotoItem: PhotosPickerItem? = nil
 
@@ -51,7 +51,7 @@ struct ChatView: View {
                         HStack(spacing: 8) {
                             ProgressView()
                                 .scaleEffect(0.9)
-                            Text("Thinking…")
+                            Text("Working on it…")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -83,7 +83,7 @@ struct ChatView: View {
             .onChange(of: sending) { _, _ in
                 scrollToBottom(proxy: proxy)
             }
-            .onChange(of: scrollTrigger) { _, _ in
+            .onChange(of: streamChunkNotifier.tick) { _, _ in
                 scrollToBottom(proxy: proxy)
             }
         }
@@ -264,20 +264,42 @@ struct ChatView: View {
         }
         let imageBase64: [String]? = imageToSend.map { [$0.base64EncodedString()] }
 
-        // Use a background *download* task so the request continues when the app is suspended (streaming data tasks are cancelled on suspend).
-        CompanionAPI.sendPromptViaBackgroundDownload(
+        // Use streaming so we get live thinking and response text; background URLSession upload task continues when app is suspended.
+        CompanionAPI.sendPromptStream(
             path: project.path,
             prompt: promptForAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "See the attached screenshot(s) above." : promptForAgent,
             host: host,
             port: port,
             imageBase64: imageBase64,
-            onComplete: { result in
+            streamThinking: true,
+            onChunk: { [messages, streamChunkNotifier] chunk in
+                Task { @MainActor in
+                    if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
+                        self.messages[idx].content += chunk
+                    }
+                    streamChunkNotifier.bump()
+                }
+            },
+            onThinkingChunk: { [messages, streamChunkNotifier] chunk in
+                Task { @MainActor in
+                    if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
+                        self.messages[idx].thinking += chunk
+                    }
+                    streamChunkNotifier.bump()
+                }
+            },
+            onComplete: { error in
                 backgroundTask.end()
                 Task { @MainActor in
                     if let idx = messages.firstIndex(where: { $0.id == currentAssistantMsgId }) {
-                        switch result {
-                        case .success(let response):
-                            var content = response.output
+                        if let err = error {
+                            let isCancelled = AppDelegate.isCancelledError(err)
+                            if !isCancelled {
+                                messages[idx].content += "\n\nError: \(err.localizedDescription)"
+                                sendError = err.localizedDescription
+                            }
+                        } else {
+                            var content = messages[idx].content
                             if let r = content.range(of: "\n[exit: ") {
                                 content = String(content[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                             }
@@ -288,12 +310,6 @@ struct ChatView: View {
                                 }
                             }
                             messages[idx].content = content
-                        case .failure(let err):
-                            let isCancelled = AppDelegate.isCancelledError(err)
-                            if !isCancelled {
-                                messages[idx].content += "\n\nError: \(err.localizedDescription)"
-                                sendError = err.localizedDescription
-                            }
                         }
                     }
                     sending = false
@@ -374,7 +390,7 @@ struct ChatBubbleView: View {
                                     HStack(spacing: 6) {
                                         ProgressView()
                                             .scaleEffect(0.8)
-                                        Text("Thinking…")
+                                        Text("Working on it…")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
