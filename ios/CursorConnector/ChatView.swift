@@ -8,10 +8,14 @@ struct ChatView: View {
     let project: ProjectEntry
     let host: String
     let port: Int
+    /// AI model ID for the agent (e.g. "auto", "claude-sonnet-4"). Defaults to "auto" when not set.
+    var model: String = "auto"
 
     @Binding var messages: [ChatMessage]
     @Binding var conversationId: UUID?
     @Binding var conversationSummaries: [ConversationSummary]
+    /// True while this conversation is being fetched from the Mac (server-only chat). Shows loading state instead of empty thread.
+    var isLoadingFromServer: Bool = false
     @State private var inputText: String = ""
     @State private var sending = false
     @State private var sendError: String?
@@ -39,8 +43,20 @@ struct ChatView: View {
     private var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(messages) { msg in
+                Group {
+                    if messages.isEmpty, conversationId != nil, isLoadingFromServer {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .scaleEffect(1.2)
+                            Text("Loading conversation…")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(.top, 60)
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(messages) { msg in
                         ChatBubbleView(
                             message: msg,
                             isStreaming: sending && messages.last?.id == msg.id && msg.role == .assistant
@@ -76,6 +92,8 @@ struct ChatView: View {
                     }
                 }
                 .padding()
+                    }
+                }
             }
             .onChange(of: messages.count) { _, _ in
                 scrollToBottom(proxy: proxy)
@@ -259,6 +277,7 @@ struct ChatView: View {
         Task {
             if needNewConversation {
                 let conv = ConversationStore.shared.createConversation(projectPath: path, messages: currentMessages)
+                CompanionAPI.syncConversation(conv, host: host, port: port)
                 let summaries = ConversationStore.shared.loadConversationSummaries(projectPath: path)
                 await MainActor.run {
                     conversationId = conv.id
@@ -292,10 +311,22 @@ struct ChatView: View {
         assistantMsgId: UUID,
         backgroundTask: BackgroundTaskHolder
     ) {
+        /// Tracks which assistant message is currently receiving streamed content; when the AI returns to think mode after content, we create a new bubble and update this.
+        let currentMessageId = CurrentStreamTarget(assistantMsgId)
+
         let throttle = StreamUpdateThrottle(flushInterval: 0.04) { [self] contentDelta, thinkingDelta in
             Task { @MainActor in
                 var copy = messages
-                if let idx = copy.firstIndex(where: { $0.id == assistantMsgId }) {
+                guard let idx = copy.firstIndex(where: { $0.id == currentMessageId.id }) else { return }
+                let alreadyHasContent = !copy[idx].content.isEmpty
+
+                if !thinkingDelta.isEmpty && alreadyHasContent {
+                    // AI returned to think mode after output — start a new chat bubble so thought process and response stay grouped and readable.
+                    if !contentDelta.isEmpty { copy[idx].content += contentDelta }
+                    let newBubble = ChatMessage(id: UUID(), role: .assistant, content: "", thinking: thinkingDelta)
+                    copy.append(newBubble)
+                    currentMessageId.id = newBubble.id
+                } else {
                     if !contentDelta.isEmpty { copy[idx].content += contentDelta }
                     if !thinkingDelta.isEmpty { copy[idx].thinking += thinkingDelta }
                 }
@@ -309,6 +340,7 @@ struct ChatView: View {
             prompt: promptForAgent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "See the attached screenshot(s) above." : promptForAgent,
             host: host,
             port: port,
+            model: model.isEmpty ? "auto" : model,
             imageBase64: imageBase64,
             streamThinking: true,
             onChunk: { throttle.appendContent($0) },
@@ -318,7 +350,7 @@ struct ChatView: View {
                 backgroundTask.end()
                 Task { @MainActor in
                     var copy = messages
-                    if let idx = copy.firstIndex(where: { $0.id == assistantMsgId }) {
+                    if let idx = copy.firstIndex(where: { $0.id == currentMessageId.id }) {
                         if let err = error {
                             let isCancelled = AppDelegate.isCancelledError(err)
                             if !isCancelled {
@@ -345,11 +377,20 @@ struct ChatView: View {
                         let title = Conversation.titleFromMessages(messages)
                         ConversationStore.shared.updateConversation(projectPath: project.path, id: cid, messages: messages, title: title)
                         conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
+                        if let conv = ConversationStore.shared.loadConversation(projectPath: project.path, id: cid) {
+                            CompanionAPI.syncConversation(conv, host: host, port: port)
+                        }
                     }
                 }
             }
         )
     }
+}
+
+/// Holds the id of the assistant message currently receiving streamed chunks; updated when we start a new bubble (think → response → think).
+private final class CurrentStreamTarget {
+    var id: UUID
+    init(_ id: UUID) { self.id = id }
 }
 
 /// Notifier used to trigger scroll-to-bottom when stream chunks arrive (ObservableObject so closures can bump it).

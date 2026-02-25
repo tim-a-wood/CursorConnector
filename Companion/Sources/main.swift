@@ -89,6 +89,8 @@ struct PromptRequest: Codable {
     var prompt: String
     /// Optional screenshot(s) as base64-encoded image data. Saved under project's .cursor/connector-screenshots/ and paths are prepended to the prompt so the agent can see them.
     var images: [String]?
+    /// AI model ID for the Cursor agent (e.g. "auto", "claude-sonnet-4"). Defaults to "auto" when missing.
+    var model: String?
 }
 
 struct PromptResponse: Codable {
@@ -145,40 +147,39 @@ private func agentEnvironment() -> [String: String] {
     return env
 }
 
-/// Force Cursor CLI to use Auto model by patching ~/.cursor/cli-config.json before this run (CLI often ignores --model when config is set).
-private func patchCLIConfigToAuto() {
+/// Force Cursor CLI to use the given model by patching ~/.cursor/cli-config.json before this run (CLI often ignores --model when config is set).
+private func patchCLIConfig(model modelId: String) {
     let configURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".cursor/cli-config.json")
     guard let data = try? Data(contentsOf: configURL),
           var config = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
     var model: [String: Any] = (config["model"] as? [String: Any]) ?? [:]
-    model["modelId"] = "auto"
-    model["displayModelId"] = "auto"
-    model["displayName"] = "Auto"
-    model["displayNameShort"] = "Auto"
-    model["aliases"] = ["auto"]
+    model["modelId"] = modelId
+    model["displayModelId"] = modelId
+    model["displayName"] = modelId
+    model["displayNameShort"] = modelId
+    model["aliases"] = [modelId]
     config["model"] = model
     config["hasChangedDefaultModel"] = true
     guard let out = try? JSONSerialization.data(withJSONObject: config) else { return }
     try? out.write(to: configURL)
 }
 
-func runAgentPrompt(path: String, prompt: String) -> (output: String, exitCode: Int32)? {
+func runAgentPrompt(path: String, prompt: String, model modelId: String = "auto") -> (output: String, exitCode: Int32)? {
     guard !path.isEmpty, path.hasPrefix("/") else { return nil }
     var isDir: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return nil }
     guard !prompt.isEmpty else { return nil }
 
-    patchCLIConfigToAuto()
+    patchCLIConfig(model: modelId)
 
-    // Use headless print mode (-p --force), --trust for workspace, --model auto.
     let process = Process()
     if let agentPath = agentExecutablePath {
         process.executableURL = URL(fileURLWithPath: agentPath)
-        process.arguments = ["--model", "auto", "-p", "--force", "--trust", prompt]
+        process.arguments = ["--model", modelId, "-p", "--force", "--trust", prompt]
     } else {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["agent", "--model", "auto", "-p", "--force", "--trust", prompt]
+        process.arguments = ["agent", "--model", modelId, "-p", "--force", "--trust", prompt]
     }
     process.currentDirectoryURL = URL(fileURLWithPath: path)
     process.environment = agentEnvironment()
@@ -215,21 +216,21 @@ func runAgentPrompt(path: String, prompt: String) -> (output: String, exitCode: 
 }
 
 /// Runs the agent and streams output via `writeChunk` (SSE-formatted data). Blocks until process exits or timeout. Returns exit code.
-func runAgentPromptStreamSync(path: String, prompt: String, writeChunk: (Data) throws -> Void) -> Int32 {
+func runAgentPromptStreamSync(path: String, prompt: String, model modelId: String = "auto", writeChunk: (Data) throws -> Void) -> Int32 {
     guard !path.isEmpty, path.hasPrefix("/") else { return -1 }
     var isDir: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return -1 }
     guard !prompt.isEmpty else { return -1 }
 
-    patchCLIConfigToAuto()
+    patchCLIConfig(model: modelId)
 
     let process = Process()
     if let agentPath = agentExecutablePath {
         process.executableURL = URL(fileURLWithPath: agentPath)
-        process.arguments = ["--model", "auto", "-p", "--force", "--trust", prompt]
+        process.arguments = ["--model", modelId, "-p", "--force", "--trust", prompt]
     } else {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["agent", "--model", "auto", "-p", "--force", "--trust", prompt]
+        process.arguments = ["agent", "--model", modelId, "-p", "--force", "--trust", prompt]
     }
     process.currentDirectoryURL = URL(fileURLWithPath: path)
     process.environment = agentEnvironment()
@@ -301,16 +302,16 @@ private func sseEvent(event: String?, data: String) -> Data {
 }
 
 /// Runs the agent with --output-format stream-json --stream-partial-output, parses JSON lines and forwards as SSE (event: thinking vs data).
-func runAgentPromptStreamJSONSync(path: String, prompt: String, writeChunk: (Data) throws -> Void) -> Int32 {
+func runAgentPromptStreamJSONSync(path: String, prompt: String, model modelId: String = "auto", writeChunk: (Data) throws -> Void) -> Int32 {
     guard !path.isEmpty, path.hasPrefix("/") else { return -1 }
     var isDir: ObjCBool = false
     guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return -1 }
     guard !prompt.isEmpty else { return -1 }
 
-    patchCLIConfigToAuto()
+    patchCLIConfig(model: modelId)
 
     let process = Process()
-    let streamJSONArgs = ["--model", "auto", "-p", "--force", "--trust", "--output-format", "stream-json", "--stream-partial-output", prompt]
+    let streamJSONArgs = ["--model", modelId, "-p", "--force", "--trust", "--output-format", "stream-json", "--stream-partial-output", prompt]
     if let agentPath = agentExecutablePath {
         process.executableURL = URL(fileURLWithPath: agentPath)
         process.arguments = streamJSONArgs
@@ -482,6 +483,125 @@ func writeFileContent(path: String, content: String) -> Bool {
     } catch {
         return false
     }
+}
+
+// MARK: - Connector conversations sync (iOS app → project folder on Mac)
+
+struct SyncConversationMessage: Codable {
+    var id: String?
+    var role: String
+    var content: String
+    var thinking: String?
+    var imageData: String?  // base64, optional
+}
+
+struct SyncConversationPayload: Codable {
+    var id: String
+    var title: String
+    var messages: [SyncConversationMessage]
+    var createdAt: String  // ISO8601
+    var updatedAt: String
+}
+
+struct SyncConversationRequest: Codable {
+    var path: String
+    var conversation: SyncConversationPayload
+}
+
+/// Writes a synced conversation into projectPath/.cursor/connector-conversations/ as JSON and Markdown so it appears when you open the project in Cursor.
+func writeSyncedConversation(projectPath: String, payload: SyncConversationPayload) -> Bool {
+    guard !projectPath.isEmpty, projectPath.hasPrefix("/"), !projectPath.contains("..") else { return false }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: projectPath, isDirectory: &isDir), isDir.boolValue else { return false }
+    let dir = (projectPath as NSString).appendingPathComponent(".cursor/connector-conversations")
+    if !FileManager.default.fileExists(atPath: dir) {
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let readme = "# Cursor Connector chats\n\nThese chats were synced from the CursorConnector iOS app. Open the `.md` files to read the conversation; `.json` holds the same data.\n"
+        _ = writeFileContent(path: (dir as NSString).appendingPathComponent("README.md"), content: readme)
+    }
+    var isDirCheck: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDirCheck), isDirCheck.boolValue else { return false }
+    let base = (dir as NSString).appendingPathComponent(payload.id)
+    let jsonPath = base + ".json"
+    let mdPath = base + ".md"
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
+    let jsonData: Data
+    do {
+        jsonData = try encoder.encode(payload)
+    } catch {
+        return false
+    }
+    guard (try? jsonData.write(to: URL(fileURLWithPath: jsonPath))) != nil else { return false }
+    var md = "# \(payload.title)\n\n"
+    md += "Updated: \(payload.updatedAt)\n\n---\n\n"
+    for msg in payload.messages {
+        let roleLabel = msg.role == "user" ? "**You**" : "**Assistant**"
+        md += "### \(roleLabel)\n\n"
+        if !(msg.thinking ?? "").isEmpty {
+            md += "_Thinking:_ \(msg.thinking!.replacingOccurrences(of: "\n", with: " "))\n\n"
+        }
+        md += msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if msg.imageData != nil { md += "\n\n_[Image attached]_" }
+        md += "\n\n"
+    }
+    return writeFileContent(path: mdPath, content: md)
+}
+
+/// Conversation list item returned by GET /conversations/list (matches iOS ConversationSummary minus projectPath).
+struct ConnectorConversationSummary: Codable {
+    var id: String
+    var title: String
+    var updatedAt: String  // ISO8601
+}
+
+/// List conversations synced in projectPath/.cursor/connector-conversations/ (from iOS or written by Companion). Newest first.
+func listConnectorConversations(projectPath: String) -> [ConnectorConversationSummary] {
+    guard !projectPath.isEmpty, projectPath.hasPrefix("/"), !projectPath.contains("..") else { return [] }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: projectPath, isDirectory: &isDir), isDir.boolValue else { return [] }
+    let dir = (projectPath as NSString).appendingPathComponent(".cursor/connector-conversations")
+    guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir), isDir.boolValue else { return [] }
+    let contents = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+    let decoder = JSONDecoder()
+    var result: [ConnectorConversationSummary] = []
+    for name in contents where (name as NSString).pathExtension == "json" {
+        let base = (name as NSString).deletingPathExtension
+        guard UUID(uuidString: base) != nil else { continue }
+        let path = (dir as NSString).appendingPathComponent(name)
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let payload = try? decoder.decode(SyncConversationPayload.self, from: data) else { continue }
+        result.append(ConnectorConversationSummary(id: payload.id, title: payload.title, updatedAt: payload.updatedAt))
+    }
+    result.sort { (a, b) in
+        guard let da = iso8601Date(a.updatedAt), let db = iso8601Date(b.updatedAt) else { return false }
+        return da > db
+    }
+    return result
+}
+
+private func iso8601Date(_ s: String) -> Date? {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    var d = formatter.date(from: s)
+    if d == nil {
+        formatter.formatOptions = [.withInternetDateTime]
+        d = formatter.date(from: s)
+    }
+    return d
+}
+
+/// Load a single conversation from projectPath/.cursor/connector-conversations/{id}.json. Returns nil if not found or invalid.
+func getConnectorConversation(projectPath: String, id: String) -> SyncConversationPayload? {
+    guard !projectPath.isEmpty, projectPath.hasPrefix("/"), !projectPath.contains(".."),
+          !id.isEmpty, UUID(uuidString: id) != nil else { return nil }
+    var isDir: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: projectPath, isDirectory: &isDir), isDir.boolValue else { return nil }
+    let dir = (projectPath as NSString).appendingPathComponent(".cursor/connector-conversations")
+    let path = (dir as NSString).appendingPathComponent("\(id).json")
+    guard FileManager.default.fileExists(atPath: path),
+          let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+    return try? JSONDecoder().decode(SyncConversationPayload.self, from: data)
 }
 
 // MARK: - Git (run in project directory on Mac)
@@ -761,6 +881,46 @@ server.POST["/files/content"] = { request in
     return .ok(.text("OK"))
 }
 
+server.POST["/conversations/sync"] = { request in
+    let body = request.body
+    guard !body.isEmpty,
+          let decoded = try? JSONDecoder().decode(SyncConversationRequest.self, from: Data(body)) else {
+        return .badRequest(.text("Missing or invalid JSON body with 'path' and 'conversation'"))
+    }
+    guard writeSyncedConversation(projectPath: decoded.path, payload: decoded.conversation) else {
+        return .badRequest(.text("Invalid project path or could not write conversation"))
+    }
+    return .ok(.text("OK"))
+}
+
+server.GET["/conversations/list"] = { request in
+    guard let pathParam = request.queryParams.first(where: { $0.0 == "path" })?.1,
+          let path = pathParam.removingPercentEncoding,
+          !path.isEmpty, path.hasPrefix("/"), !path.contains("..") else {
+        return .badRequest(.text("Missing or invalid 'path' query parameter"))
+    }
+    let list = listConnectorConversations(projectPath: path)
+    guard let data = try? JSONEncoder().encode(list) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
+server.GET["/conversations/get"] = { request in
+    guard let pathParam = request.queryParams.first(where: { $0.0 == "path" })?.1,
+          let path = pathParam.removingPercentEncoding,
+          !path.isEmpty, path.hasPrefix("/"), !path.contains("..") else {
+        return .badRequest(.text("Missing or invalid 'path' query parameter"))
+    }
+    guard let idParam = request.queryParams.first(where: { $0.0 == "id" })?.1,
+          let id = idParam.removingPercentEncoding, !id.isEmpty else {
+        return .badRequest(.text("Missing or invalid 'id' query parameter"))
+    }
+    guard let payload = getConnectorConversation(projectPath: path, id: id) else {
+        return .notFound
+    }
+    guard let data = try? JSONEncoder().encode(payload) else { return .internalServerError }
+    return .ok(.data(data, contentType: "application/json"))
+}
+
 server.POST["/prompt"] = { request in
     let body = request.body
     guard !body.isEmpty,
@@ -768,7 +928,8 @@ server.POST["/prompt"] = { request in
         return .badRequest(.text("Missing or invalid JSON body with 'path' and 'prompt'"))
     }
     let prompt = promptWithSavedScreenshots(projectPath: decoded.path, prompt: decoded.prompt, images: decoded.images)
-    guard let result = runAgentPrompt(path: decoded.path, prompt: prompt) else {
+    let modelId = decoded.model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? decoded.model! : "auto"
+    guard let result = runAgentPrompt(path: decoded.path, prompt: prompt, model: modelId) else {
         return .badRequest(.text("Invalid path or empty prompt"))
     }
     var output = result.output
@@ -788,6 +949,7 @@ server.POST["/prompt-stream"] = { request in
     }
     let path = decoded.path
     let prompt = promptWithSavedScreenshots(projectPath: decoded.path, prompt: decoded.prompt, images: decoded.images)
+    let modelId = decoded.model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? decoded.model! : "auto"
     let streamJSON = request.queryParams.first(where: { $0.0 == "stream" })?.1 == "json"
     let headers: [String: String] = [
         "Content-Type": "text/event-stream",
@@ -802,11 +964,11 @@ server.POST["/prompt-stream"] = { request in
         }
         let exitCode: Int32
         if streamJSON {
-            exitCode = runAgentPromptStreamJSONSync(path: path, prompt: prompt) { chunk in
+            exitCode = runAgentPromptStreamJSONSync(path: path, prompt: prompt, model: modelId) { chunk in
                 try writer.write(chunk)
             }
         } else {
-            exitCode = runAgentPromptStreamSync(path: path, prompt: prompt) { chunk in
+            exitCode = runAgentPromptStreamSync(path: path, prompt: prompt, model: modelId) { chunk in
                 try writer.write(chunk)
             }
         }
@@ -1635,6 +1797,9 @@ do {
     print("  GET  /files/tree    - list directory (query: path=...)")
     print("  GET  /files/content - file content (query: path=...)")
     print("  POST /files/content - write file (body: {\"path\": \"...\", \"content\": \"...\"})")
+    print("  GET  /conversations/list - list chats for project (query: path=...); shared with iOS")
+    print("  GET  /conversations/get  - get one chat (query: path=..., id=...)")
+    print("  POST /conversations/sync - sync iOS chat to project (body: {\"path\": \"...\", \"conversation\": {...}})")
     print("  POST /projects/open - open project (body: {\"path\": \"/absolute/path\"})")
     print("  POST /prompt        - run agent (body: {\"path\": \"/project/path\", \"prompt\": \"...\"})")
     print("  POST /prompt-stream - run agent with SSE streaming output")

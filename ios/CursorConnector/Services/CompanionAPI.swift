@@ -85,7 +85,7 @@ enum CompanionAPI {
         var exitCode: Int
     }
 
-    static func sendPrompt(path: String, prompt: String, host: String, port: Int = defaultPort) async throws -> PromptResponse {
+    static func sendPrompt(path: String, prompt: String, host: String, port: Int = defaultPort, model: String = "auto") async throws -> PromptResponse {
         try await withRetry {
             guard let base = baseURL(host: host, port: port) else {
                 throw URLError(.badURL)
@@ -95,7 +95,9 @@ enum CompanionAPI {
             request.httpMethod = "POST"
             request.timeoutInterval = promptTimeout
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try JSONEncoder().encode(["path": path, "prompt": prompt])
+            var body: [String: Any] = ["path": path, "prompt": prompt]
+            if !model.isEmpty { body["model"] = model }
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else {
                 throw URLError(.badServerResponse)
@@ -119,6 +121,7 @@ enum CompanionAPI {
         prompt: String,
         host: String,
         port: Int = defaultPort,
+        model: String = "auto",
         imageBase64: [String]? = nil,
         onComplete: @escaping (Result<PromptResponse, Error>) -> Void
     ) {
@@ -133,6 +136,7 @@ enum CompanionAPI {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         do {
             var body: [String: Any] = ["path": path, "prompt": prompt]
+            if !model.isEmpty { body["model"] = model }
             if let images = imageBase64, !images.isEmpty {
                 body["images"] = images
             }
@@ -154,6 +158,7 @@ enum CompanionAPI {
         prompt: String,
         host: String,
         port: Int = defaultPort,
+        model: String = "auto",
         imageBase64: [String]? = nil,
         streamThinking: Bool = true,
         onChunk: @escaping (String) -> Void,
@@ -177,6 +182,7 @@ enum CompanionAPI {
         let bodyData: Data
         do {
             var body: [String: Any] = ["path": path, "prompt": prompt]
+            if !model.isEmpty { body["model"] = model }
             if let images = imageBase64, !images.isEmpty {
                 body["images"] = images
             }
@@ -313,6 +319,139 @@ enum CompanionAPI {
     struct FileWriteRequest: Codable {
         var path: String
         var content: String
+    }
+
+    // MARK: - Conversation sync (iOS → Mac project folder)
+
+    private static let iso8601Formatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    /// Payload for POST /conversations/sync; matches Companion’s SyncConversationPayload.
+    private struct SyncConversationPayload: Codable {
+        var id: String
+        var title: String
+        var messages: [SyncConversationMessage]
+        var createdAt: String
+        var updatedAt: String
+    }
+
+    private struct SyncConversationMessage: Codable {
+        var id: String?
+        var role: String
+        var content: String
+        var thinking: String?
+        var imageData: String?
+    }
+
+    private struct SyncConversationRequest: Codable {
+        var path: String
+        var conversation: SyncConversationPayload
+    }
+
+    /// Response from GET /conversations/list (server-side connector-conversations folder).
+    private struct RemoteConversationSummary: Codable {
+        var id: String
+        var title: String
+        var updatedAt: String
+    }
+
+    /// Fetches conversation summaries for a project from the Mac (project/.cursor/connector-conversations/). Used to merge with local list for shared history.
+    static func fetchConversationSummaries(path: String, host: String, port: Int = defaultPort) async throws -> [ConversationSummary] {
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            var components = URLComponents(url: base.appendingPathComponent("conversations/list"), resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "path", value: path)]
+            guard let url = components.url else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+                throw URLError(.badServerResponse)
+            }
+            let decoder = JSONDecoder()
+            let remote = try decoder.decode([RemoteConversationSummary].self, from: data)
+            let formatterWithFraction = ISO8601DateFormatter()
+            formatterWithFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let formatterPlain = ISO8601DateFormatter()
+            formatterPlain.formatOptions = [.withInternetDateTime]
+            return remote.compactMap { r -> ConversationSummary? in
+                guard let uuid = UUID(uuidString: r.id) else { return nil }
+                let updatedAt = formatterWithFraction.date(from: r.updatedAt) ?? formatterPlain.date(from: r.updatedAt)
+                guard let date = updatedAt else { return nil }
+                return ConversationSummary(id: uuid, projectPath: path, title: r.title, updatedAt: date)
+            }
+        }
+    }
+
+    /// Fetches a single conversation from the Mac. Returns nil if not found or on error. Use to load a conversation that exists on server but not locally.
+    static func fetchConversation(path: String, id: UUID, host: String, port: Int = defaultPort) async throws -> Conversation? {
+        try await withRetry {
+            guard let base = baseURL(host: host, port: port) else { throw URLError(.badURL) }
+            var components = URLComponents(url: base.appendingPathComponent("conversations/get"), resolvingAgainstBaseURL: false)!
+            components.queryItems = [URLQueryItem(name: "path", value: path), URLQueryItem(name: "id", value: id.uuidString)]
+            guard let url = components.url else { throw URLError(.badURL) }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = fileRequestTimeout
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+            if http.statusCode == 404 { return nil }
+            guard http.statusCode == 200 else { throw URLError(.badServerResponse) }
+            let payload = try JSONDecoder().decode(SyncConversationPayload.self, from: data)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var createdAt = formatter.date(from: payload.createdAt)
+            var updatedAt = formatter.date(from: payload.updatedAt)
+            if createdAt == nil || updatedAt == nil {
+                formatter.formatOptions = [.withInternetDateTime]
+                if createdAt == nil { createdAt = formatter.date(from: payload.createdAt) }
+                if updatedAt == nil { updatedAt = formatter.date(from: payload.updatedAt) }
+            }
+            guard let cid = UUID(uuidString: payload.id), let created = createdAt, let updated = updatedAt else { return nil }
+            let messages: [ChatMessage] = payload.messages.map { m in
+                let msgId = (m.id.flatMap { UUID(uuidString: $0) }) ?? UUID()
+                let role: ChatRole = m.role == "user" ? .user : .assistant
+                let imageData = m.imageData.flatMap { Data(base64Encoded: $0) }
+                return ChatMessage(id: msgId, role: role, content: m.content, thinking: m.thinking ?? "", imageData: imageData)
+            }
+            return Conversation(id: cid, projectPath: path, title: payload.title, messages: messages, createdAt: created, updatedAt: updated)
+        }
+    }
+
+    /// Syncs a conversation to the Mac so it appears under project/.cursor/connector-conversations/ when you open the project in Cursor. Fire-and-forget; ignores errors.
+    static func syncConversation(_ conversation: Conversation, host: String, port: Int = defaultPort) {
+        guard let base = baseURL(host: host, port: port) else { return }
+        let url = base.appendingPathComponent("conversations/sync")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = fileRequestTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let messages: [SyncConversationMessage] = conversation.messages.map { msg in
+            SyncConversationMessage(
+                id: msg.id.uuidString,
+                role: msg.role.rawValue,
+                content: msg.content,
+                thinking: msg.thinking.isEmpty ? nil : msg.thinking,
+                imageData: msg.imageData?.base64EncodedString()
+            )
+        }
+        let createdAtStr = iso8601Formatter.string(from: conversation.createdAt)
+        let updatedAtStr = iso8601Formatter.string(from: conversation.updatedAt)
+        let payload = SyncConversationPayload(
+            id: conversation.id.uuidString,
+            title: conversation.title,
+            messages: messages,
+            createdAt: createdAtStr,
+            updatedAt: updatedAtStr
+        )
+        let body = SyncConversationRequest(path: conversation.projectPath, conversation: payload)
+        guard let bodyData = try? JSONEncoder().encode(body) else { return }
+        request.httpBody = bodyData
+        URLSession.shared.dataTask(with: request) { _, _, _ in
+            // Fire-and-forget; no need to surface sync failures to the user
+        }.resume()
     }
 
     // MARK: - Git

@@ -1,11 +1,24 @@
 import SwiftUI
 import UIKit
 
+/// Known AI model IDs and display names for the Cursor agent.
+private let knownModelIds = ["auto", "claude-sonnet-4", "gpt-4o"]
+private func displayName(for modelId: String) -> String {
+    switch modelId {
+    case "auto": return "Auto"
+    case "claude-sonnet-4": return "Claude Sonnet 4"
+    case "gpt-4o": return "GPT-4o"
+    case "custom": return "Custom…"
+    default: return modelId
+    }
+}
+
 /// Server and project configuration. Structured for clear hierarchy: Connection → Project → Updates.
 struct ConfigView: View {
     @Binding var host: String
     @Binding var port: String
     @Binding var selectedProject: ProjectEntry?
+    @AppStorage("cursorConnectorModel") private var modelId = "auto"
     @AppStorage("testflightInviteURL") private var testflightInviteURL = ""
 
     @State private var projects: [ProjectEntry] = []
@@ -22,6 +35,7 @@ struct ConfigView: View {
         NavigationStack {
             List {
                 connectionSection
+                modelSection
                 projectSection
                 updatesSection
             }
@@ -115,6 +129,30 @@ struct ConfigView: View {
             Text("Connection")
         } footer: {
             Text("Same Wi‑Fi: use your Mac’s IP (e.g. 192.168.1.x).")
+        }
+    }
+
+    // MARK: - AI model
+
+    private var modelSection: some View {
+        Section {
+            Picker("AI model", selection: Binding(
+                get: { knownModelIds.contains(modelId) ? modelId : "custom" },
+                set: { if $0 != "custom" { modelId = $0 } }
+            )) {
+                ForEach(knownModelIds + ["custom"], id: \.self) { id in
+                    Text(displayName(for: id)).tag(id)
+                }
+            }
+            if !knownModelIds.contains(modelId) {
+                TextField("Model ID", text: $modelId)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+        } header: {
+            Text("AI model")
+        } footer: {
+            Text("Model used for chat and agent requests. Auto lets Cursor choose.")
         }
     }
 

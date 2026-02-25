@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @AppStorage("cursorConnectorHost") private var host = ""
     @AppStorage("cursorConnectorPort") private var port = "9283"
+    @AppStorage("cursorConnectorModel") private var selectedModel = "auto"
     @State private var selectedProject: ProjectEntry?
     @State private var messages: [ChatMessage] = []
     /// When nil, current messages are an unsaved "new chat". When set, we're viewing/continuing that conversation.
@@ -22,6 +23,8 @@ struct ContentView: View {
     @State private var loadingRecentProjects = false
     @State private var recentProjectsError: String?
     @State private var selectedTab: ProjectTab = .chat
+    /// True while fetching a conversation from the Mac (server-only chat). ChatView shows loading until done.
+    @State private var loadingServerConversation = false
 
     private var portInt: Int { Int(port) ?? CompanionAPI.defaultPort }
 
@@ -56,7 +59,9 @@ struct ContentView: View {
                     selectedConversationId = nil
                     selectedTab = .chat
                     messages = []
+                    loadingServerConversation = false
                     conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
+                    Task { await mergeServerConversations(projectPath: project.path) }
                 }
             }
             .navigationTitle(selectedProject != nil ? navigationTitle : "Cursor")
@@ -112,16 +117,32 @@ struct ContentView: View {
                         project: project,
                         summaries: conversationSummaries,
                         currentConversationId: selectedConversationId,
+                        onAppear: { Task { await mergeServerConversations(projectPath: project.path) } },
                         onSelect: { id in
                             selectedConversationId = id
                             if let conv = ConversationStore.shared.loadConversation(projectPath: project.path, id: id) {
                                 messages = conv.messages
+                                loadingServerConversation = false
+                            } else {
+                                messages = []
+                                loadingServerConversation = true
+                                Task {
+                                    defer { Task { @MainActor in loadingServerConversation = false } }
+                                    if let conv = try? await CompanionAPI.fetchConversation(path: project.path, id: id, host: host, port: portInt) {
+                                        await MainActor.run {
+                                            ConversationStore.shared.save(conv)
+                                            messages = conv.messages
+                                            conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
+                                        }
+                                    }
+                                }
                             }
                             showChatList = false
                         },
                         onNewChat: {
                             selectedConversationId = nil
                             messages = []
+                            loadingServerConversation = false
                             showChatList = false
                         },
                         onDismiss: { showChatList = false }
@@ -173,9 +194,11 @@ struct ContentView: View {
                 project: project,
                 host: host,
                 port: portInt,
+                model: selectedModel.isEmpty ? "auto" : selectedModel,
                 messages: $messages,
                 conversationId: $selectedConversationId,
-                conversationSummaries: $conversationSummaries
+                conversationSummaries: $conversationSummaries,
+                isLoadingFromServer: loadingServerConversation
             )
             .tabItem { Label("Chat", systemImage: "bubble.left.and.bubble.right") }
             .tag(ProjectTab.chat)
@@ -237,6 +260,30 @@ struct ContentView: View {
         conversationSummaries = ConversationStore.shared.loadConversationSummaries(projectPath: project.path)
         Task {
             try? await CompanionAPI.openProject(path: project.path, host: host, port: portInt)
+        }
+    }
+
+    /// Fetches conversation list from Mac and merges with local (by id, keep newer updatedAt). Enables shared chat history across devices.
+    private func mergeServerConversations(projectPath: String) async {
+        guard !host.isEmpty else { return }
+        do {
+            let server = try await CompanionAPI.fetchConversationSummaries(path: projectPath, host: host, port: portInt)
+            await MainActor.run {
+                guard selectedProject?.path == projectPath else { return }
+                let local = ConversationStore.shared.loadConversationSummaries(projectPath: projectPath)
+                var byId: [UUID: ConversationSummary] = [:]
+                for s in local { byId[s.id] = s }
+                for s in server {
+                    if let existing = byId[s.id] {
+                        if s.updatedAt > existing.updatedAt { byId[s.id] = s }
+                    } else {
+                        byId[s.id] = s
+                    }
+                }
+                conversationSummaries = byId.values.sorted { $0.updatedAt > $1.updatedAt }
+            }
+        } catch {
+            // Keep local list on network error
         }
     }
 
@@ -429,6 +476,7 @@ private struct ChatListView: View {
     let project: ProjectEntry
     let summaries: [ConversationSummary]
     let currentConversationId: UUID?
+    var onAppear: (() -> Void)? = nil
     let onSelect: (UUID) -> Void
     let onNewChat: () -> Void
     let onDismiss: () -> Void
@@ -445,6 +493,7 @@ private struct ChatListView: View {
             listContent
                 .navigationTitle("Chats")
                 .navigationBarTitleDisplayMode(.inline)
+                .onAppear(perform: onAppear ?? {})
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
                         Button("Done") { onDismiss() }
